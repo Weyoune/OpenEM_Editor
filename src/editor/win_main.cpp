@@ -3546,7 +3546,7 @@ void command(App& a, UINT id) {
         case ID_VIEW_DEVIATION: a.view_deviation = !a.view_deviation; InvalidateRect(a.canvas, nullptr, FALSE); break;
         case ID_VIEW_CHANGES: a.view_changes = !a.view_changes; a.changes_rev = ~0u; InvalidateRect(a.canvas, nullptr, FALSE); break;
         case ID_HELP_ABOUT:
-            MessageBoxW(a.main, L"OpenEM Editor\nBilder des Eishockey Manager (1993) bearbeiten.\n\nTeil von OpenEM (GPL-3.0).", L"Info", MB_OK | MB_ICONINFORMATION);
+            MessageBoxW(a.main, L"OpenEM Editor 0.2\nBilder, Szenen, Töne und Mannschaften des Eishockey Managers (1993) bearbeiten.\n\nGPL-3.0, github.com/Weyoune/OpenEM_Editor", L"Info", MB_OK | MB_ICONINFORMATION);
             break;
         default: break;
     }
