@@ -25,6 +25,7 @@ public:
     bool dirty() const { return dirty_; }
     unsigned revision() const { return revision_; }
     const std::string& status() const { return status_; }
+    void set_status(const std::string& s) { status_ = s; }
 
     const VocSound& sound() const { return sound_; }
     size_t capacity() const { return capacity_; }         // size of the original file = the game's buffer

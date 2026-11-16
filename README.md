@@ -2,6 +2,8 @@
 
 Asset- und Mannschaftseditor für die Originaldaten des **Eishockey Managers** (1993), ein Nebenprojekt von [OpenEM](https://github.com/Weyoune/OpenEM). Windows, native Oberfläche (Win32), eine einzelne `em_editor.exe` ohne weitere Laufzeit.
 
+Bilder (mit Auswahlwerkzeugen, PNG-Import und -Export), Palettenabweichung, Torszenen-Grafik, Paletten, Hallenkarten, Mannschaften, **Spielszenen** (Torszenen-Skripte abspielen und bearbeiten, neue Szenen anlegen) und **Töne** (WAV-Import und -Export in der passenden Qualität), dazu Mod-Pakete (ZIP) und der Vergleich mit dem Original.
+
 Der Editor enthält **keine Spieldaten**. Man braucht eine eigene Kopie des DOS-Spiels (den Ordner mit `EM.EXE`, `KB` und `TORE`).
 
 ## Benutzen

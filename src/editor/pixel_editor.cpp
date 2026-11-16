@@ -180,6 +180,7 @@ bool PixelEditor::load_file(const fs::path& p, int number) {
         sel_valid_ = false;
         deviation_.clear();
         report_ = ImportReport();
+        baseline_for_ = -1;
         undo_.clear();
         redo_.clear();
         revision_++;
@@ -207,6 +208,7 @@ bool PixelEditor::save() {
         std::ofstream f(p, std::ios::binary | std::ios::trunc);
         f.write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size()));
         if (!f) throw std::runtime_error("Schreiben fehlgeschlagen");
+        baseline_for_ = -1;
         dirty_ = false;
         status_ = "KB" + std::to_string(current_) + " gespeichert (" + std::to_string(out.size()) +
                   " Byte, Sicherung als .bak)";
@@ -585,20 +587,27 @@ bool PixelEditor::has_backup() const {
 
 std::vector<uint8_t> PixelEditor::changed_pixels() const {
     if (current_ < 0) return {};
-    const fs::path p = kb_ / (std::to_string(current_) + ".vga");
-    fs::path baseline = p;
-    baseline += ".bak";
-    std::error_code ec;
-    if (!fs::exists(baseline, ec)) baseline = p;
-    try {
-        PixelEditor other(kb_.parent_path());
-        if (!other.load_file(baseline, current_) || other.img_.width != img_.width || other.img_.height != img_.height) return {};
-        std::vector<uint8_t> out(img_.pixels.size());
-        for (size_t i = 0; i < out.size(); i++) out[i] = other.img_.pixels[i] != img_.pixels[i];
-        return out;
-    } catch (const std::exception&) {
-        return {};
+    if (baseline_for_ != current_) {
+        baseline_for_ = current_;
+        baseline_ok_ = false;
+        const fs::path p = kb_ / (std::to_string(current_) + ".vga");
+        fs::path baseline = p;
+        baseline += ".bak";
+        std::error_code ec;
+        if (!fs::exists(baseline, ec)) baseline = p;
+        try {
+            PixelEditor other(kb_.parent_path());
+            if (other.load_file(baseline, current_)) {
+                baseline_ = other.img_;
+                baseline_ok_ = true;
+            }
+        } catch (const std::exception&) {
+        }
     }
+    if (!baseline_ok_ || baseline_.width != img_.width || baseline_.height != img_.height) return {};
+    std::vector<uint8_t> out(img_.pixels.size());
+    for (size_t i = 0; i < out.size(); i++) out[i] = baseline_.pixels[i] != img_.pixels[i];
+    return out;
 }
 
 bool PixelEditor::restore_original() {

@@ -124,6 +124,9 @@ private:
     int sx_ = 0, sy_ = 0, lx_ = 0, ly_ = 0;
     std::vector<uint8_t> base_;
     ImportReport report_;
+    mutable Image baseline_;  // the file as it was before the editor touched it (cached for changed_pixels)
+    mutable int baseline_for_ = -1;
+    mutable bool baseline_ok_ = false;
     std::vector<uint8_t> deviation_;
     bool sel_valid_ = false;
     Rect sel_, sel_orig_;

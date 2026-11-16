@@ -19,19 +19,23 @@
 #include <uxtheme.h>
 #include <wincodec.h>
 #include <windowsx.h>
+#include <mmsystem.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "editor/map_doc.hpp"
+#include "editor/modpack.hpp"
 #include "editor/palette_doc.hpp"
 #include "editor/pixel_editor.hpp"
 #include "editor/scene_doc.hpp"
+#include "editor/sound_doc.hpp"
 #include "editor/team_doc.hpp"
 
 #pragma comment(lib, "comctl32.lib")
@@ -41,12 +45,17 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "winmm.lib")
 
 namespace fs = std::filesystem;
 using em::editor::MapDoc;
 using em::editor::PaletteDoc;
 using em::editor::PixelEditor;
 using em::editor::SceneDoc;
+using em::editor::SoundDoc;
+using em::Bytes;
+using em::VocFit;
+using em::VocSound;
 using em::editor::TeamDoc;
 
 namespace {
@@ -54,20 +63,25 @@ namespace {
 enum Cmd : UINT {
     ID_FILE_SAVE = 101, ID_FILE_EXPORT, ID_FILE_EXIT, ID_FILE_IMPORT,
     ID_EDIT_UNDO = 110, ID_EDIT_REDO,
-    ID_TOOL_PENCIL = 120, ID_TOOL_LINE, ID_TOOL_RECT, ID_TOOL_FILLRECT, ID_TOOL_FILL, ID_TOOL_PICKER,
+    ID_TOOL_PENCIL = 120, ID_TOOL_LINE, ID_TOOL_RECT, ID_TOOL_FILLRECT, ID_TOOL_FILL, ID_TOOL_PICKER, ID_TOOL_SELECT,
     ID_VIEW_GRID = 130, ID_VIEW_FIT, ID_VIEW_ZOOMIN, ID_VIEW_ZOOMOUT,
     ID_HELP_ABOUT = 140,
+    ID_EDIT_COPY = 150, ID_EDIT_CUT, ID_EDIT_PASTE, ID_EDIT_DELETE, ID_EDIT_SELECTALL, ID_EDIT_FLIPH, ID_EDIT_FLIPV, ID_EDIT_ROTATE,
+    ID_FILE_EXPORTALL = 160, ID_FILE_IMPORTDIR, ID_FILE_MODPACK, ID_FILE_MODAPPLY, ID_FILE_RESTORE, ID_FILE_NEWSCENE,
+    ID_VIEW_DEVIATION = 170, ID_VIEW_CHANGES,
     IDC_TOOLBAR = 201, IDC_LIST, IDC_STATUS, IDC_TAB,
     IDC_TRACK_R = 210, IDC_TRACK_G, IDC_TRACK_B,
     IDC_MIRROR = 430,
     IDC_PALSEL = 400, IDC_CREST_PEN = 420, IDC_CREST_FILL, IDC_CREST_UNDO, IDC_CREST_SAVE, IDC_CREST_ZOUT, IDC_CREST_ZIN,
     IDC_SC_LIST = 500, IDC_SC_TRACK, IDC_SC_PREV, IDC_SC_PLAY, IDC_SC_NEXT, IDC_SC_MODE, IDC_SC_ARENA, IDC_SC_SPRITE, IDC_SC_TOEND,
     IDC_SC_X, IDC_SC_Y, IDC_SC_SOUND, IDC_SC_KEEP, IDC_SC_INS, IDC_SC_DUP, IDC_SC_DEL,
+    IDC_SN_PLAY = 600, IDC_SN_STOP, IDC_SN_EXPORT, IDC_SN_IMPORT, IDC_SN_LOOP, IDC_SN_QUALITY, IDC_SN_NORM, IDC_SN_DITHER, IDC_SN_TRIM,
+    IDC_SC_RTO = 520, IDC_SC_RX, IDC_SC_RY, IDC_SC_MOVE, IDC_SC_SMOOTH, IDC_SC_HOME, IDC_SC_AWAY,
     IDC_CLUB = 300, IDC_NAME0 = 310, IDC_FOR0 = 340, IDC_CREST = 370, IDC_PLACE, IDC_STR0 = 372, IDC_JER0 = 380, IDC_SWAP_BTN = 390, IDC_SWAP_COMBO,
 };
 
 const wchar_t kCrestClass[] = L"OpenEMEditorCrest", kMapClass[] = L"OpenEMEditorMap", kTilesClass[] = L"OpenEMEditorTiles";
-const wchar_t kSceneClass[] = L"OpenEMEditorScene", kPickerClass[] = L"OpenEMEditorPicker";
+const wchar_t kWaveClass[] = L"OpenEMEditorWave", kSceneClass[] = L"OpenEMEditorScene", kPickerClass[] = L"OpenEMEditorPicker";
 const wchar_t kMainClass[] = L"OpenEMEditorMain", kCanvasClass[] = L"OpenEMEditorCanvas", kPaletteClass[] = L"OpenEMEditorPalette", kPalGridClass[] = L"OpenEMEditorPalGrid";
 
 std::wstring widen(const std::string& s) {
@@ -103,7 +117,15 @@ struct SceneUi {
     HWND mode = nullptr, arena = nullptr, subjects = nullptr, lbl_sprite = nullptr, sprite = nullptr, sprite_ud = nullptr, to_end = nullptr;
     HWND lbl_x = nullptr, x = nullptr, x_ud = nullptr, lbl_y = nullptr, y = nullptr, y_ud = nullptr, lbl_sound = nullptr, sound = nullptr, sound_ud = nullptr;
     HWND keep = nullptr, ins = nullptr, dup = nullptr, del = nullptr;
+    HWND lbl_route = nullptr, route_to = nullptr, lbl_rx = nullptr, route_x = nullptr, lbl_ry = nullptr, route_y = nullptr, move_btn = nullptr, smooth_btn = nullptr;
+    HWND lbl_home = nullptr, home = nullptr, lbl_away = nullptr, away = nullptr;
     std::vector<HWND> all;  // every control of the page, for show/hide and fonts
+};
+
+struct SoundUi {
+    HWND view = nullptr, info = nullptr, play = nullptr, stop = nullptr, exp = nullptr, imp = nullptr, loop = nullptr, lbl_q = nullptr, quality = nullptr;
+    HWND norm = nullptr, dither = nullptr, trim = nullptr, note = nullptr;
+    std::vector<HWND> all;
 };
 
 struct App {
@@ -118,6 +140,15 @@ struct App {
     std::unique_ptr<PaletteDoc> pal;
     std::unique_ptr<MapDoc> map;
     MapUi mu;
+    std::unique_ptr<SoundDoc> sound;
+    SoundUi sn_ui;
+    int sn_sel0 = -1, sn_sel1 = -1, sn_drag = -1, sn_orig_rate = 8000;
+    bool sn_loading = false;
+    Bytes sn_wav;  // the sound being played (PlaySound reads it directly)
+    bool view_deviation = false, view_changes = false;  // overlays of the image canvas
+    std::vector<uint8_t> changes_mask;
+    unsigned changes_rev = ~0u;
+    int changes_for = -1;
     std::unique_ptr<SceneDoc> scene;
     SceneUi su;
     std::vector<std::string> sc_names;  // list item number -> script name
@@ -126,6 +157,7 @@ struct App {
     SceneGeo sc_lock;
     POINT sc_grab{};
     std::wstring sc_hover;
+    int sc_route_key = -1;
     std::vector<uint32_t> sc_bits;
     int map_tile = 0, map_zoom = 1, mscroll_x = 0, mscroll_y = 0, tscroll_y = 0, map_hc = -1, map_hr = -1;
     bool map_mirror = false;
@@ -240,6 +272,34 @@ std::wstring image_dialog(bool save, const std::wstring& name, HWND owner) {
     return result;
 }
 
+std::wstring file_dialog(bool save, const wchar_t* title, const wchar_t* filter_name, const wchar_t* pattern, const wchar_t* def_ext, const std::wstring& name, HWND owner) {
+    std::wstring result;
+    IFileDialog* d = nullptr;
+    if (FAILED(CoCreateInstance(save ? CLSID_FileSaveDialog : CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d))))
+        return result;
+    DWORD opts = 0;
+    d->GetOptions(&opts);
+    d->SetOptions(opts | FOS_FORCEFILESYSTEM);
+    d->SetTitle(title);
+    const COMDLG_FILTERSPEC spec[] = {{filter_name, pattern}};
+    d->SetFileTypes(1, spec);
+    if (def_ext) d->SetDefaultExtension(def_ext);
+    if (save) d->SetFileName(name.c_str());
+    if (SUCCEEDED(d->Show(owner))) {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(d->GetResult(&item))) {
+            PWSTR p = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &p))) {
+                result = p;
+                CoTaskMemFree(p);
+            }
+            item->Release();
+        }
+    }
+    d->Release();
+    return result;
+}
+
 template <class T>
 struct ComPtr {
     T* p = nullptr;
@@ -301,21 +361,22 @@ bool pal_tab(const App& a) { return a.tab_index == 2; }
 bool team_tab(const App& a) { return a.tab_index == 3; }
 bool map_tab(const App& a) { return a.tab_index == 4; }
 bool scene_tab(const App& a) { return a.tab_index == 5; }
+bool sound_tab(const App& a) { return a.tab_index == 6; }
 
 void refresh(App& a) {
     PixelEditor& e = *a.ed;
-    const bool tt = team_tab(a), mt = map_tab(a), sc = scene_tab(a), pt = pal_tab(a) || tt || mt || sc;  // pt: a page without the pixel tools
-    const int cur = sc ? (a.scene->loaded() ? 1 : -1) : mt ? a.map->current() : tt ? 23 : pt ? a.pal->current() : e.current();
-    const bool dirty = sc ? a.scene->dirty() : mt ? a.map->dirty() : tt ? a.team->dirty() || a.crest_ed->dirty() : pt ? a.pal->dirty() : e.dirty();
+    const bool tt = team_tab(a), mt = map_tab(a), sc = scene_tab(a), sn = sound_tab(a), pt = pal_tab(a) || tt || mt || sc || sn;  // pt: a page without the pixel tools
+    const int cur = sn ? a.sound->current() : sc ? (a.scene->loaded() ? 1 : -1) : mt ? a.map->current() : tt ? 23 : pt ? a.pal->current() : e.current();
+    const bool dirty = sn ? a.sound->dirty() : sc ? a.scene->dirty() : mt ? a.map->dirty() : tt ? a.team->dirty() || a.crest_ed->dirty() : pt ? a.pal->dirty() : e.dirty();
     std::wstring title = cur < 0 ? L"OpenEM Editor" : sc ? L"TORE\\" + widen(a.scene->name()) + (dirty ? L" *" : L"") + L" – OpenEM Editor" : L"KB" + std::to_wstring(cur) + (dirty ? L" *" : L"") + L" – OpenEM Editor";
     SetWindowTextW(a.main, title.c_str());
     // toolbar
     SendMessage(a.toolbar, TB_CHECKBUTTON, ID_TOOL_PENCIL + int(e.tool()), TRUE);
     SendMessage(a.toolbar, TB_CHECKBUTTON, ID_VIEW_GRID, a.grid);
-    for (int id = ID_TOOL_PENCIL; id <= ID_TOOL_PICKER; id++)  // hall maps: paint, fill and pick only
+    for (int id = ID_TOOL_PENCIL; id <= ID_TOOL_SELECT; id++)  // hall maps: paint, fill and pick only
         SendMessage(a.toolbar, TB_ENABLEBUTTON, id, !pt || (mt && (id == ID_TOOL_PENCIL || id == ID_TOOL_FILL || id == ID_TOOL_PICKER)));
-    SendMessage(a.toolbar, TB_ENABLEBUTTON, ID_EDIT_UNDO, sc ? a.scene->can_undo() : mt ? a.map->can_undo() : pt ? dirty : e.can_undo());
-    SendMessage(a.toolbar, TB_ENABLEBUTTON, ID_EDIT_REDO, sc ? a.scene->can_redo() : mt ? a.map->can_redo() : !pt && e.can_redo());
+    SendMessage(a.toolbar, TB_ENABLEBUTTON, ID_EDIT_UNDO, sn ? dirty : sc ? a.scene->can_undo() : mt ? a.map->can_undo() : pt ? dirty : e.can_undo());
+    SendMessage(a.toolbar, TB_ENABLEBUTTON, ID_EDIT_REDO, sn ? false : sc ? a.scene->can_redo() : mt ? a.map->can_redo() : !pt && e.can_redo());
     SendMessage(a.toolbar, TB_ENABLEBUTTON, ID_FILE_SAVE, cur >= 0 && dirty);
     SendMessage(a.toolbar, TB_ENABLEBUTTON, ID_VIEW_GRID, !pt || mt);
     SendMessage(a.toolbar, TB_ENABLEBUTTON, ID_VIEW_FIT, !pt);
@@ -324,12 +385,22 @@ void refresh(App& a) {
     EnableMenuItem(m, ID_FILE_SAVE, MF_BYCOMMAND | (cur >= 0 && dirty ? MF_ENABLED : MF_GRAYED));
     EnableMenuItem(m, ID_FILE_EXPORT, MF_BYCOMMAND | (!pt && e.current() >= 0 ? MF_ENABLED : MF_GRAYED));
     EnableMenuItem(m, ID_FILE_IMPORT, MF_BYCOMMAND | (!pt && e.current() >= 0 ? MF_ENABLED : MF_GRAYED));
-    EnableMenuItem(m, ID_EDIT_UNDO, MF_BYCOMMAND | ((sc ? a.scene->can_undo() : mt ? a.map->can_undo() : pt ? dirty : e.can_undo()) ? MF_ENABLED : MF_GRAYED));
-    EnableMenuItem(m, ID_EDIT_REDO, MF_BYCOMMAND | ((sc ? a.scene->can_redo() : mt ? a.map->can_redo() : !pt && e.can_redo()) ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(m, ID_EDIT_UNDO, MF_BYCOMMAND | ((sn ? dirty : sc ? a.scene->can_undo() : mt ? a.map->can_undo() : pt ? dirty : e.can_undo()) ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(m, ID_EDIT_REDO, MF_BYCOMMAND | ((sn ? false : sc ? a.scene->can_redo() : mt ? a.map->can_redo() : !pt && e.can_redo()) ? MF_ENABLED : MF_GRAYED));
     CheckMenuItem(m, ID_VIEW_GRID, MF_BYCOMMAND | (a.grid ? MF_CHECKED : MF_UNCHECKED));
-    CheckMenuRadioItem(m, ID_TOOL_PENCIL, ID_TOOL_PICKER, ID_TOOL_PENCIL + int(e.tool()), MF_BYCOMMAND);
+    CheckMenuRadioItem(m, ID_TOOL_PENCIL, ID_TOOL_SELECT, ID_TOOL_PENCIL + int(e.tool()), MF_BYCOMMAND);
+    CheckMenuItem(m, ID_VIEW_DEVIATION, MF_BYCOMMAND | (a.view_deviation ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(m, ID_VIEW_CHANGES, MF_BYCOMMAND | (a.view_changes ? MF_CHECKED : MF_UNCHECKED));
+    for (UINT id : {ID_EDIT_COPY, ID_EDIT_CUT, ID_EDIT_PASTE, ID_EDIT_DELETE, ID_EDIT_SELECTALL, ID_EDIT_FLIPH, ID_EDIT_FLIPV, ID_EDIT_ROTATE})
+        EnableMenuItem(m, id, MF_BYCOMMAND | (!pt && e.current() >= 0 ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(m, ID_EDIT_PASTE, MF_BYCOMMAND | (!pt && e.current() >= 0 && e.has_clipboard() ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(m, ID_FILE_EXPORTALL, MF_BYCOMMAND | (a.tab_index <= 1 ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(m, ID_FILE_IMPORTDIR, MF_BYCOMMAND | (a.tab_index <= 1 ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(m, ID_FILE_NEWSCENE, MF_BYCOMMAND | (sc && a.scene->loaded() ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(m, ID_VIEW_DEVIATION, MF_BYCOMMAND | (!pt ? MF_ENABLED : MF_GRAYED));
+    EnableMenuItem(m, ID_VIEW_CHANGES, MF_BYCOMMAND | (!pt ? MF_ENABLED : MF_GRAYED));
     // status bar
-    SendMessage(a.status, SB_SETTEXT, 0, (LPARAM)widen(sc ? a.scene->status() : mt ? a.map->status() : tt ? a.team->status() : pt ? a.pal->status() : e.status()).c_str());
+    SendMessage(a.status, SB_SETTEXT, 0, (LPARAM)widen(sn ? a.sound->status() : sc ? a.scene->status() : mt ? a.map->status() : tt ? a.team->status() : pt ? a.pal->status() : e.status()).c_str());
     std::wstring right = mt ? a.map_hover + L"   Zoom " + std::to_wstring(a.map_zoom) + L"×" : L"";
     if (sc) right = a.sc_hover;
     if (!pt) {
@@ -368,13 +439,20 @@ void open_scene(App& a, int index);
 void show_scene(App& a, bool on);
 void layout_scene(App& a, int x, int y, int w, int h, int rx, int rw);
 void scene_stop(App& a);
+void sync_sound(App& a);
+void show_sound(App& a, bool on);
+void layout_sound(App& a, int x, int y, int w, int h, int rx, int rw);
+void open_sound(App& a, int number);
+void sound_stop();
+bool scene_route_command(App& a, UINT id, UINT code);
+std::wstring file_dialog(bool save, const wchar_t* title, const wchar_t* filter_name, const wchar_t* pattern, const wchar_t* def_ext, const std::wstring& name, HWND owner);
 
 bool confirm_discard(App& a) {
-    const bool pt = pal_tab(a), tt = team_tab(a), mt = map_tab(a), sc = scene_tab(a);
+    const bool pt = pal_tab(a), tt = team_tab(a), mt = map_tab(a), sc = scene_tab(a), sn = sound_tab(a);
     if (tt && !crest_confirm(a)) return false;
-    const bool dirty = sc ? a.scene->dirty() : mt ? a.map->dirty() : tt ? a.team->dirty() : pt ? a.pal->dirty() : a.ed->dirty();
+    const bool dirty = sn ? a.sound->dirty() : sc ? a.scene->dirty() : mt ? a.map->dirty() : tt ? a.team->dirty() : pt ? a.pal->dirty() : a.ed->dirty();
     if (!dirty) return true;
-    const int cur = mt ? a.map->current() : tt ? 23 : pt ? a.pal->current() : a.ed->current();
+    const int cur = sn ? a.sound->current() : mt ? a.map->current() : tt ? 23 : pt ? a.pal->current() : a.ed->current();
     std::wstring head = (sc ? L"TORE\\" + widen(a.scene->name()) : L"KB" + std::to_wstring(cur)) + L" wurde geändert.";
     TASKDIALOG_BUTTON buttons[] = {{101, L"Speichern"}, {102, L"Verwerfen"}};
     TASKDIALOGCONFIG cfg{sizeof cfg};
@@ -390,8 +468,9 @@ bool confirm_discard(App& a) {
     cfg.nDefaultButton = 101;
     int pressed = 0;
     if (FAILED(TaskDialogIndirect(&cfg, &pressed, nullptr, nullptr))) return false;
-    if (pressed == 101) return sc ? a.scene->save() : mt ? a.map->save() : tt ? team_save(a) : pt ? a.pal->save() : a.ed->save();
-    if (pressed == 102 && sc) { a.scene->load(a.scene->name()); sync_scene(a); }
+    if (pressed == 101) return sn ? a.sound->save() : sc ? a.scene->save() : mt ? a.map->save() : tt ? team_save(a) : pt ? a.pal->save() : a.ed->save();
+    if (pressed == 102 && sn) { a.sound->revert(); sync_sound(a); }
+    else if (pressed == 102 && sc) { a.scene->load(a.scene->name()); sync_scene(a); }
     else if (pressed == 102 && mt) a.map->load(a.map->current());
     else if (pressed == 102 && tt) a.team->revert();
     else if (pressed == 102 && pt) a.pal->revert();
@@ -454,6 +533,8 @@ void fill_list(App& a) {
             const int place = a.team->data(t).place;
             add(t, team_label(a, t), place >= 0 ? std::to_wstring(place) : L"–", team_group(t));
         }
+    } else if (sound_tab(a)) {
+        for (int n : SoundDoc::numbers()) add(n, SoundDoc::label(n), L"");
     } else if (scene_tab(a)) {
         const wchar_t* heads[] = {L"Heim greift an · Tor", L"Heim greift an · vergebene Chance", L"Gast greift an · Tor", L"Gast greift an · vergebene Chance"};
         for (int g = 0; g < 4; g++) {
@@ -498,6 +579,17 @@ void fit_zoom(App& a) {
 }
 
 void open_image(App& a, int number) {
+    if (sound_tab(a)) {
+        if (number == a.sound->current()) return;
+        if (!confirm_discard(a)) {
+            select_in_list(a, a.sound->current());
+            return;
+        }
+        open_sound(a, number);
+        select_in_list(a, a.sound->current());
+        refresh(a);
+        return;
+    }
     if (scene_tab(a)) {  // the number is an index into the list of scenes
         if (a.sc_names.empty() || number < 0 || size_t(number) >= a.sc_names.size() || a.sc_names[size_t(number)] == a.scene->name()) return;
         if (!confirm_discard(a)) {
@@ -579,10 +671,11 @@ void sync_sliders(App& a) {
 }
 
 void show_tab_controls(App& a) {
-    const bool pt = pal_tab(a), tt = team_tab(a), mt = map_tab(a), sc = scene_tab(a);
-    ShowWindow(a.canvas, pt || tt || mt || sc ? SW_HIDE : SW_SHOW);
-    ShowWindow(a.palette, pt || tt || mt || sc ? SW_HIDE : SW_SHOW);
-    ShowWindow(a.psel, pt || tt || mt || sc ? SW_HIDE : SW_SHOW);
+    const bool pt = pal_tab(a), tt = team_tab(a), mt = map_tab(a), sc = scene_tab(a), sn = sound_tab(a);
+    ShowWindow(a.canvas, pt || tt || mt || sc || sn ? SW_HIDE : SW_SHOW);
+    ShowWindow(a.palette, pt || tt || mt || sc || sn ? SW_HIDE : SW_SHOW);
+    ShowWindow(a.psel, pt || tt || mt || sc || sn ? SW_HIDE : SW_SHOW);
+    show_sound(a, sn);
     show_team(a, tt);
     show_map(a, mt);
     show_scene(a, sc);
@@ -625,6 +718,7 @@ void layout(App& a) {
     layout_map(a, lw, top, std::max(10, int(r.right) - lw - pw), bottom - top, r.right - pw, pw);
     layout_team(a, lw, top, std::max(10, int(r.right) - lw - pw), bottom - top, r.right - pw, pw);
     layout_scene(a, lw, top, std::max(10, int(r.right) - lw - pw), bottom - top, r.right - pw, pw);
+    layout_sound(a, lw, top, std::max(10, int(r.right) - lw - pw), bottom - top, r.right - pw, pw);
     const int w1 = a.px(260);
     int parts[2] = {std::max(w1, int(r.right) - w1), -1};
     SendMessage(a.status, SB_SETPARTS, 2, (LPARAM)parts);
@@ -636,7 +730,12 @@ void switch_tab(App& a, int index) {
     a.tab_index = index;
     a.hover_x = -1;
     fill_list(a);
-    if (scene_tab(a)) {
+    sound_stop();
+    if (sound_tab(a)) {
+        if (a.sound->current() < 0) open_sound(a, SoundDoc::numbers().front());
+        select_in_list(a, a.sound->current());
+        sync_sound(a);
+    } else if (scene_tab(a)) {
         if (!a.scene->loaded() && !a.sc_names.empty()) open_scene(a, 0);
         select_in_list(a, a.scene->loaded() ? int(std::find(a.sc_names.begin(), a.sc_names.end(), a.scene->name()) - a.sc_names.begin()) : -1);
     } else if (map_tab(a)) {
@@ -720,9 +819,26 @@ void paint_canvas(App& a, HWND hwnd) {
         const auto& img = e.image();
         const auto& pal = e.palette();
         a.bits.resize(img.pixels.size());
+        const std::vector<uint8_t>* dev = a.view_deviation && e.deviation().size() == img.pixels.size() ? &e.deviation() : nullptr;
+        const std::vector<uint8_t>* chg = nullptr;
+        if (a.view_changes) {
+            if (a.changes_rev != e.revision() || a.changes_for != e.current()) {
+                a.changes_mask = e.changed_pixels();
+                a.changes_rev = e.revision();
+                a.changes_for = e.current();
+            }
+            if (a.changes_mask.size() == img.pixels.size()) chg = &a.changes_mask;
+        }
+        const auto tint = [](uint32_t c, uint32_t t, int pct) {
+            uint32_t out = 0;
+            for (int sh = 0; sh <= 16; sh += 8) out |= (((c >> sh & 255) * uint32_t(100 - pct) + (t >> sh & 255) * uint32_t(pct)) / 100) << sh;
+            return out;
+        };
         for (size_t i = 0; i < a.bits.size(); i++) {
             const auto& c = pal.rgb[img.pixels[i]];
             a.bits[i] = uint32_t(c[0]) << 16 | uint32_t(c[1]) << 8 | c[2];
+            if (dev && (*dev)[i]) a.bits[i] = tint(a.bits[i], 0xFF2020, 65);      // import: colour not in the palette
+            if (chg && (*chg)[i]) a.bits[i] = tint(a.bits[i], 0xFFD000, 55);      // differs from the original
         }
         BITMAPINFO bi{};
         bi.bmiHeader.biSize = sizeof bi.bmiHeader;
@@ -764,6 +880,21 @@ void paint_canvas(App& a, HWND hwnd) {
         }
         RECT fr{g.ox - 1, g.oy - 1, g.ox + g.iw + 1, g.oy + g.ih + 1};
         FrameRect(mem, &fr, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        if (e.has_selection()) {  // black line with a dotted white one on top
+            const auto sel = e.selection();
+            const int x0 = g.ox + sel.x0 * a.zoom, y0 = g.oy + sel.y0 * a.zoom, x1 = g.ox + (sel.x1 + 1) * a.zoom, y1 = g.oy + (sel.y1 + 1) * a.zoom;
+            HGDIOBJ ob = SelectObject(mem, GetStockObject(NULL_BRUSH));
+            HPEN black = CreatePen(PS_SOLID, 1, RGB(0, 0, 0)), white = CreatePen(PS_DOT, 1, RGB(255, 255, 255));
+            HGDIOBJ op = SelectObject(mem, black);
+            Rectangle(mem, x0, y0, x1 + 1, y1 + 1);
+            SetBkMode(mem, TRANSPARENT);
+            SelectObject(mem, white);
+            Rectangle(mem, x0, y0, x1 + 1, y1 + 1);
+            SelectObject(mem, op);
+            SelectObject(mem, ob);
+            DeleteObject(black);
+            DeleteObject(white);
+        }
     } else {
         SelectObject(mem, a.font);
         SetBkMode(mem, TRANSPARENT);
@@ -2009,6 +2140,14 @@ void sync_scene(App& a) {
         set_number(u.sprite, obj ? s.sprite(n, a.sc_sel) : 0);
         set_number(u.sound, s.sound(n));
         for (HWND w : {u.sprite, u.sprite_ud, u.to_end}) EnableWindow(w, obj);
+        const int route_key = n * 100 + a.sc_sel;
+        if (route_key != a.sc_route_key) {
+            a.sc_route_key = route_key;
+            set_number(u.route_x, p.x);
+            set_number(u.route_y, p.y);
+            set_number(u.route_to, std::min(s.frames(), n + 10));
+        }
+        for (HWND w : {u.route_to, u.route_x, u.route_y, u.move_btn, u.smooth_btn}) EnableWindow(w, on);
         EnableWindow(u.sound, n >= 1);
         EnableWindow(u.sound_ud, n >= 1);
         EnableWindow(u.dup, n >= 1);
@@ -2382,6 +2521,28 @@ void create_scene_controls(App& a) {
     u.dup = make(L"BUTTON", L"Kopieren", BS_PUSHBUTTON | WS_TABSTOP, 0, IDC_SC_DUP);
     u.del = make(L"BUTTON", L"Löschen", BS_PUSHBUTTON | WS_TABSTOP, 0, IDC_SC_DEL);
     SendMessage(u.track, TBM_SETPAGESIZE, 0, 10);
+    u.lbl_route = make(L"STATIC", L"Bahn bis Bild", 0, 0, 0);
+    u.route_to = make(L"EDIT", L"", WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, IDC_SC_RTO);
+    u.lbl_rx = make(L"STATIC", L"x", 0, 0, 0);
+    u.route_x = make(L"EDIT", L"", WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, IDC_SC_RX);
+    u.lbl_ry = make(L"STATIC", L"y", 0, 0, 0);
+    u.route_y = make(L"EDIT", L"", WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, IDC_SC_RY);
+    u.move_btn = make(L"BUTTON", L"Bewegen", BS_PUSHBUTTON | WS_TABSTOP, 0, IDC_SC_MOVE);
+    u.smooth_btn = make(L"BUTTON", L"Glätten", BS_PUSHBUTTON | WS_TABSTOP, 0, IDC_SC_SMOOTH);
+    u.lbl_home = make(L"STATIC", L"Trikot Heim", 0, 0, 0);
+    u.home = make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, IDC_SC_HOME);
+    u.lbl_away = make(L"STATIC", L"Gast", 0, 0, 0);
+    u.away = make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, IDC_SC_AWAY);
+    for (HWND c : {u.home, u.away}) {
+        SendMessage(c, CB_ADDSTRING, 0, (LPARAM)L"Standardfarbe");
+        SendMessage(c, CB_SETITEMDATA, 0, -1);
+        for (int t = 0; t < TeamDoc::kTeams; t++) {
+            if (!TeamDoc::editable(t)) continue;
+            const LRESULT i = SendMessage(c, CB_ADDSTRING, 0, (LPARAM)widen(a.team->club_name(t)).c_str());
+            SendMessage(c, CB_SETITEMDATA, WPARAM(i), t);
+        }
+        SendMessage(c, CB_SETCURSEL, 0, 0);
+    }
     for (HWND w : u.all) SendMessage(w, WM_SETFONT, (WPARAM)a.font, TRUE);
 }
 
@@ -2392,7 +2553,7 @@ void show_scene(App& a, bool on) {
 void layout_scene(App& a, int x, int y, int w, int h, int rx, int rw) {
     SceneUi& u = a.su;
     if (!u.view) return;
-    const int bar = a.px(66), m = a.px(8), bh = a.px(24);
+    const int bar = a.px(126), m = a.px(8), bh = a.px(24);
     MoveWindow(u.view, x, y, w, std::max(a.px(60), h - bar), TRUE);
     const int by = y + h - bar + a.px(4);
     MoveWindow(u.lbl, x + m, by, a.px(130), bh, TRUE);
@@ -2404,6 +2565,20 @@ void layout_scene(App& a, int x, int y, int w, int h, int rx, int rw) {
     const int cw = std::max(a.px(120), (w - 2 * m - a.px(184)) / 2);
     MoveWindow(u.mode, x + m + a.px(184), by2, cw, a.px(300), TRUE);
     MoveWindow(u.arena, x + m + a.px(184) + cw + a.px(6), by2, cw, a.px(300), TRUE);
+    const int by3 = by2 + bh + a.px(6);
+    MoveWindow(u.lbl_route, x + m, by3 + a.px(3), a.px(84), bh, TRUE);
+    MoveWindow(u.route_to, x + m + a.px(86), by3, a.px(48), bh - a.px(1), TRUE);
+    MoveWindow(u.lbl_rx, x + m + a.px(144), by3 + a.px(3), a.px(14), bh, TRUE);
+    MoveWindow(u.route_x, x + m + a.px(158), by3, a.px(54), bh - a.px(1), TRUE);
+    MoveWindow(u.lbl_ry, x + m + a.px(222), by3 + a.px(3), a.px(14), bh, TRUE);
+    MoveWindow(u.route_y, x + m + a.px(236), by3, a.px(54), bh - a.px(1), TRUE);
+    MoveWindow(u.move_btn, x + m + a.px(300), by3, a.px(78), bh, TRUE);
+    MoveWindow(u.smooth_btn, x + m + a.px(384), by3, a.px(70), bh, TRUE);
+    const int by4 = by3 + bh + a.px(6), cw2 = std::max(a.px(100), (w - 2 * m - a.px(120)) / 2);
+    MoveWindow(u.lbl_home, x + m, by4 + a.px(3), a.px(78), bh, TRUE);
+    MoveWindow(u.home, x + m + a.px(80), by4, cw2, a.px(300), TRUE);
+    MoveWindow(u.lbl_away, x + m + a.px(90) + cw2, by4 + a.px(3), a.px(34), bh, TRUE);
+    MoveWindow(u.away, x + m + a.px(126) + cw2, by4, cw2, a.px(300), TRUE);
     // right panel
     const int px0 = rx + m, pw = rw - 2 * m;
     int py = y + m;
@@ -2521,6 +2696,42 @@ bool scene_command(App& a, UINT id, UINT code) {
     }
 }
 
+// Path tools and shirt colours
+bool scene_route_command(App& a, UINT id, UINT code) {
+    SceneDoc& s = *a.scene;
+    SceneUi& u = a.su;
+    if (id == IDC_SC_MOVE || id == IDC_SC_SMOOTH) {
+        if (!s.loaded()) return true;
+        scene_stop(a);
+        const int to = get_number(u.route_to, a.sc_pos + 1);
+        if (to <= a.sc_pos || to > s.frames()) {
+            s.set_status("Bahn: das Zielbild muss nach dem aktuellen Bild liegen (höchstens Bild " + std::to_string(s.frames()) + ")");
+        } else if (id == IDC_SC_MOVE) {
+            s.route(a.sc_sel, a.sc_pos, to, get_number(u.route_x, 0), get_number(u.route_y, 0), a.sc_keep);
+        } else {
+            s.smooth(a.sc_sel, a.sc_pos, to);
+        }
+        a.sc_route_key = -1;
+        refresh(a);
+        return true;
+    }
+    if ((id == IDC_SC_HOME || id == IDC_SC_AWAY) && code == CBN_SELCHANGE) {
+        const int side = id == IDC_SC_HOME ? 0 : 1;
+        HWND c = side ? u.away : u.home;
+        const LRESULT i = SendMessage(c, CB_GETCURSEL, 0, 0);
+        const int team = i >= 0 ? int(SendMessage(c, CB_GETITEMDATA, WPARAM(i), 0)) : -1;
+        if (team < 0) {
+            if (side) s.set_shirt(1, 0xF0, 0xF0, 0xF0);
+            else s.set_shirt(0, 0xE0, 0x30, 0x30);
+        } else {
+            s.set_shirt_jersey(side, a.team->data(team).jersey);
+        }
+        sync_scene(a);
+        return true;
+    }
+    return true;
+}
+
 // The arrows of the x / y fields step one pixel at once (typing applies when the field is left)
 void scene_updown(App& a, NMUPDOWN* ud, int id) {
     SceneDoc& s = *a.scene;
@@ -2529,6 +2740,529 @@ void scene_updown(App& a, NMUPDOWN* ud, int id) {
     const int step = ud->iDelta > 0 ? 1 : -1;
     s.move_to(a.sc_pos, a.sc_sel, p.x + (id == IDC_SC_X + 1000 ? step : 0), p.y + (id == IDC_SC_Y + 1000 ? step : 0), a.sc_keep);
     refresh(a);
+}
+
+// ------------------------------------------------------------------------------------------------ sound editor
+
+std::wstring format_seconds(double s) {
+    wchar_t buf[32];
+    swprintf(buf, 32, L"%.2f s", s);
+    return buf;
+}
+
+void sync_sound(App& a) {
+    SoundUi& u = a.sn_ui;
+    if (!u.view) return;
+    SoundDoc& s = *a.sound;
+    const bool on = s.current() >= 0;
+    std::wstring info;
+    if (on) {
+        const VocSound& v = s.sound();
+        info = SoundDoc::label(s.current()) + L"\r\n" + std::to_wstring(v.sample_rate) + L" Hz, 8 Bit, mono\r\n" + std::to_wstring(v.pcm.size()) + L" Samples, " + format_seconds(s.seconds()) +
+               L"\r\nDatei " + std::to_wstring(s.file_size()) + L" von " + std::to_wstring(s.capacity()) + L" Byte (Puffer des Spiels)";
+        if (s.sound().loops) info += L"\r\nWird im Spiel endlos wiederholt";
+        if (a.sn_sel0 >= 0) info += L"\r\nAuswahl: " + format_seconds(double(a.sn_sel0) / v.sample_rate) + L" – " + format_seconds(double(a.sn_sel1) / v.sample_rate);
+        const VocFit& f = s.last_fit();
+        if (s.dirty() && f.source_rate) {
+            info += L"\r\n\r\nImport: " + std::to_wstring(f.source_rate) + L" Hz → " + std::to_wstring(v.sample_rate) + L" Hz";
+            if (f.trimmed) info += L"\r\nDas Ende wurde abgeschnitten (passt nicht in den Puffer)";
+            if (f.clipped) info += L"\r\nÜbersteuert";
+            wchar_t g[32];
+            swprintf(g, 32, L"\r\nLautstärke ×%.2f", f.gain);
+            info += g;
+        }
+    } else {
+        info = L"Links einen Ton wählen";
+    }
+    SetWindowTextW(u.info, info.c_str());
+    a.sn_loading = true;
+    SendMessage(u.loop, BM_SETCHECK, on && s.sound().loops ? BST_CHECKED : BST_UNCHECKED, 0);
+    a.sn_loading = false;
+    for (HWND w : {u.play, u.stop, u.exp, u.imp, u.loop, u.trim}) EnableWindow(w, on);
+    EnableWindow(u.trim, on && a.sn_sel0 >= 0);
+    InvalidateRect(u.view, nullptr, FALSE);
+}
+
+void sound_stop() { PlaySoundW(nullptr, nullptr, 0); }
+
+void sound_play(App& a) {
+    SoundDoc& s = *a.sound;
+    if (s.current() < 0) return;
+    VocSound v = s.sound();
+    if (a.sn_sel0 >= 0 && a.sn_sel1 > a.sn_sel0) v.pcm = std::vector<uint8_t>(v.pcm.begin() + a.sn_sel0, v.pcm.begin() + a.sn_sel1);
+    a.sn_wav = em::encode_wav8(v);
+    DWORD flags = SND_MEMORY | SND_ASYNC | SND_NODEFAULT;
+    if (v.loops && a.sn_sel0 < 0) flags |= SND_LOOP;
+    PlaySoundW(reinterpret_cast<LPCWSTR>(a.sn_wav.data()), nullptr, flags);
+}
+
+void open_sound(App& a, int number) {
+    sound_stop();
+    a.sn_sel0 = a.sn_sel1 = -1;
+    if (a.sound->load(number)) a.sn_orig_rate = a.sound->sound().sample_rate;
+    sync_sound(a);
+}
+
+struct WaveGeo {
+    int ox, oy, w, h;
+    size_t samples;
+};
+
+WaveGeo wave_geo(App& a) {
+    RECT r;
+    GetClientRect(a.sn_ui.view, &r);
+    const int m = a.px(14);
+    return {m, m, std::max(10, int(r.right) - 2 * m), std::max(10, int(r.bottom) - 2 * m - a.px(18)), a.sound->sound().pcm.size()};
+}
+
+int wave_sample_at(App& a, int mx) {
+    const WaveGeo g = wave_geo(a);
+    if (!g.samples) return 0;
+    return int(std::clamp<long long>(static_cast<long long>(mx - g.ox) * static_cast<long long>(g.samples) / g.w, 0, static_cast<long long>(g.samples)));
+}
+
+void paint_wave(App& a, HWND h) {
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(h, &ps);
+    RECT cr;
+    GetClientRect(h, &cr);
+    HDC mem = CreateCompatibleDC(dc);
+    HBITMAP bmp = CreateCompatibleBitmap(dc, cr.right, cr.bottom);
+    HGDIOBJ old = SelectObject(mem, bmp);
+    HBRUSH bg = CreateSolidBrush(RGB(32, 34, 38));
+    FillRect(mem, &cr, bg);
+    DeleteObject(bg);
+    SelectObject(mem, a.font);
+    SetBkMode(mem, TRANSPARENT);
+    SoundDoc& s = *a.sound;
+    if (s.current() >= 0 && !s.sound().pcm.empty()) {
+        const WaveGeo g = wave_geo(a);
+        const auto& pcm = s.sound().pcm;
+        if (a.sn_sel0 >= 0) {
+            const int x0 = g.ox + int(static_cast<long long>(a.sn_sel0) * g.w / static_cast<long long>(g.samples)), x1 = g.ox + int(static_cast<long long>(a.sn_sel1) * g.w / static_cast<long long>(g.samples));
+            RECT sr{x0, g.oy, std::max(x1, x0 + 1), g.oy + g.h};
+            HBRUSH sb = CreateSolidBrush(RGB(48, 72, 110));
+            FillRect(mem, &sr, sb);
+            DeleteObject(sb);
+        }
+        const int mid = g.oy + g.h / 2;
+        HPEN grid = CreatePen(PS_SOLID, 1, RGB(70, 74, 82));
+        HGDIOBJ op = SelectObject(mem, grid);
+        MoveToEx(mem, g.ox, mid, nullptr);
+        LineTo(mem, g.ox + g.w, mid);
+        SelectObject(mem, op);
+        DeleteObject(grid);
+        HPEN pen = CreatePen(PS_SOLID, 1, RGB(110, 200, 255));
+        op = SelectObject(mem, pen);
+        for (int x = 0; x < g.w; x++) {
+            const size_t i0 = size_t(static_cast<long long>(x) * static_cast<long long>(g.samples) / g.w), i1 = std::max(i0 + 1, size_t(static_cast<long long>(x + 1) * static_cast<long long>(g.samples) / g.w));
+            int lo = 255, hi = 0;
+            for (size_t i = i0; i < i1 && i < g.samples; i++) {
+                lo = std::min<int>(lo, pcm[i]);
+                hi = std::max<int>(hi, pcm[i]);
+            }
+            MoveToEx(mem, g.ox + x, mid - (hi - 128) * (g.h / 2) / 128, nullptr);
+            LineTo(mem, g.ox + x, mid - (lo - 128) * (g.h / 2) / 128 + 1);
+        }
+        SelectObject(mem, op);
+        DeleteObject(pen);
+        SetTextColor(mem, RGB(170, 175, 185));
+        const std::wstring t0 = L"0 s", t1 = format_seconds(s.seconds());
+        TextOutW(mem, g.ox, g.oy + g.h + a.px(2), t0.c_str(), int(t0.size()));
+        SIZE sz;
+        GetTextExtentPoint32W(mem, t1.c_str(), int(t1.size()), &sz);
+        TextOutW(mem, g.ox + g.w - sz.cx, g.oy + g.h + a.px(2), t1.c_str(), int(t1.size()));
+        const std::wstring hint = L"Bereich ziehen: Auswahl (Abspielen, Zuschneiden)";
+        GetTextExtentPoint32W(mem, hint.c_str(), int(hint.size()), &sz);
+        TextOutW(mem, g.ox + (g.w - sz.cx) / 2, g.oy + g.h + a.px(2), hint.c_str(), int(hint.size()));
+    } else {
+        SetTextColor(mem, RGB(190, 190, 195));
+        DrawTextW(mem, L"Links einen Ton wählen", -1, &cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    BitBlt(dc, 0, 0, cr.right, cr.bottom, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, old);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    EndPaint(h, &ps);
+}
+
+LRESULT CALLBACK wave_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    App& a = *g_app;
+    switch (msg) {
+        case WM_ERASEBKGND: return 1;
+        case WM_PAINT: paint_wave(a, h); return 0;
+        case WM_SETCURSOR:
+            if (LOWORD(lp) == HTCLIENT) { SetCursor(LoadCursor(nullptr, IDC_IBEAM)); return TRUE; }
+            break;
+        case WM_LBUTTONDOWN:
+            if (a.sound->current() < 0) return 0;
+            SetFocus(h);
+            SetCapture(h);
+            a.sn_drag = wave_sample_at(a, GET_X_LPARAM(lp));
+            a.sn_sel0 = a.sn_sel1 = -1;
+            sync_sound(a);
+            return 0;
+        case WM_MOUSEMOVE:
+            if (GetCapture() == h && a.sn_drag >= 0) {
+                const int x = wave_sample_at(a, GET_X_LPARAM(lp));
+                a.sn_sel0 = std::min(a.sn_drag, x);
+                a.sn_sel1 = std::max(a.sn_drag, x);
+                if (a.sn_sel1 - a.sn_sel0 < 2) a.sn_sel0 = a.sn_sel1 = -1;
+                sync_sound(a);
+            }
+            return 0;
+        case WM_LBUTTONUP:
+            if (GetCapture() == h) ReleaseCapture();
+            a.sn_drag = -1;
+            return 0;
+        case WM_KEYDOWN:
+            if (wp == VK_SPACE) { sound_play(a); return 0; }
+            if (wp == VK_ESCAPE) { sound_stop(); return 0; }
+            break;
+        default: break;
+    }
+    return DefWindowProc(h, msg, wp, lp);
+}
+
+void create_sound_controls(App& a) {
+    SoundUi& u = a.sn_ui;
+    auto make = [&](const wchar_t* cls, const wchar_t* text, DWORD style, DWORD ex, int id) {
+        HWND w = CreateWindowExW(ex, cls, text, WS_CHILD | style, 0, 0, 0, 0, a.main, (HMENU)UINT_PTR(id), a.inst, nullptr);
+        u.all.push_back(w);
+        return w;
+    };
+    u.view = CreateWindowExW(WS_EX_CLIENTEDGE, kWaveClass, nullptr, WS_CHILD, 0, 0, 0, 0, a.main, nullptr, a.inst, nullptr);
+    u.all.push_back(u.view);
+    u.info = make(L"STATIC", L"", 0, 0, 0);
+    u.play = make(L"BUTTON", L"Abspielen", BS_PUSHBUTTON | WS_TABSTOP, 0, IDC_SN_PLAY);
+    u.stop = make(L"BUTTON", L"Stopp", BS_PUSHBUTTON | WS_TABSTOP, 0, IDC_SN_STOP);
+    u.exp = make(L"BUTTON", L"WAV exportieren…", BS_PUSHBUTTON | WS_TABSTOP, 0, IDC_SN_EXPORT);
+    u.imp = make(L"BUTTON", L"WAV importieren…", BS_PUSHBUTTON | WS_TABSTOP, 0, IDC_SN_IMPORT);
+    u.loop = make(L"BUTTON", L"Endlos wiederholen", BS_AUTOCHECKBOX | WS_TABSTOP, 0, IDC_SN_LOOP);
+    u.lbl_q = make(L"STATIC", L"Qualität beim Import", 0, 0, 0);
+    u.quality = make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, IDC_SN_QUALITY);
+    for (const wchar_t* t : {L"Beste (bis 16 kHz)", L"Bis 11 kHz", L"Bis 8 kHz", L"Wie das Original"}) SendMessage(u.quality, CB_ADDSTRING, 0, (LPARAM)t);
+    SendMessage(u.quality, CB_SETCURSEL, 0, 0);
+    u.norm = make(L"BUTTON", L"Lautstärke normalisieren", BS_AUTOCHECKBOX | WS_TABSTOP, 0, IDC_SN_NORM);
+    SendMessage(u.norm, BM_SETCHECK, BST_CHECKED, 0);
+    u.dither = make(L"BUTTON", L"Rauschen gegen Stufen (Dithering)", BS_AUTOCHECKBOX | WS_TABSTOP, 0, IDC_SN_DITHER);
+    u.trim = make(L"BUTTON", L"Auswahl behalten (zuschneiden)", BS_PUSHBUTTON | WS_TABSTOP, 0, IDC_SN_TRIM);
+    u.note = make(L"STATIC",
+                  L"Das Spiel lädt jeden Ton in einen Puffer von der Größe der Originaldatei. Der Import wandelt jede WAV-Datei in 8 Bit mono und wählt die höchste Abtastrate, bei der der ganze Ton noch hineinpasst; nur wenn selbst 4 kHz nicht reichen, wird das Ende abgeschnitten.",
+                  0, 0, 0);
+    for (HWND w : u.all) SendMessage(w, WM_SETFONT, (WPARAM)a.font, TRUE);
+}
+
+void show_sound(App& a, bool on) {
+    for (HWND w : a.sn_ui.all) ShowWindow(w, on ? SW_SHOW : SW_HIDE);
+}
+
+void layout_sound(App& a, int x, int y, int w, int h, int rx, int rw) {
+    SoundUi& u = a.sn_ui;
+    if (!u.view) return;
+    MoveWindow(u.view, x, y, w, h, TRUE);
+    const int m = a.px(10), bw = rw - 2 * m, bh = a.px(26);
+    int py = y + m;
+    MoveWindow(u.info, rx + m, py, bw, a.px(150), TRUE);
+    py += a.px(158);
+    MoveWindow(u.play, rx + m, py, (bw - a.px(6)) / 2, bh, TRUE);
+    MoveWindow(u.stop, rx + m + (bw - a.px(6)) / 2 + a.px(6), py, (bw - a.px(6)) / 2, bh, TRUE);
+    py += bh + a.px(6);
+    MoveWindow(u.exp, rx + m, py, bw, bh, TRUE);
+    py += bh + a.px(6);
+    MoveWindow(u.imp, rx + m, py, bw, bh, TRUE);
+    py += bh + a.px(10);
+    MoveWindow(u.lbl_q, rx + m, py, bw, a.px(20), TRUE);
+    py += a.px(22);
+    MoveWindow(u.quality, rx + m, py, bw, a.px(200), TRUE);
+    py += bh + a.px(4);
+    MoveWindow(u.norm, rx + m, py, bw, a.px(22), TRUE);
+    py += a.px(24);
+    MoveWindow(u.dither, rx + m, py, bw, a.px(22), TRUE);
+    py += a.px(30);
+    MoveWindow(u.loop, rx + m, py, bw, a.px(22), TRUE);
+    py += a.px(26);
+    MoveWindow(u.trim, rx + m, py, bw, bh, TRUE);
+    py += bh + a.px(12);
+    MoveWindow(u.note, rx + m, py, bw, std::max(a.px(60), y + h - py - m), TRUE);
+}
+
+bool sound_command(App& a, UINT id, UINT code) {
+    SoundDoc& s = *a.sound;
+    switch (id) {
+        case IDC_SN_PLAY: sound_play(a); return true;
+        case IDC_SN_STOP: sound_stop(); return true;
+        case IDC_SN_LOOP:
+            if (code == BN_CLICKED && !a.sn_loading && s.current() >= 0) {
+                s.set_loops(SendMessage(a.sn_ui.loop, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                refresh(a);
+            }
+            return true;
+        case IDC_SN_TRIM:
+            if (s.current() >= 0 && a.sn_sel0 >= 0) {
+                sound_stop();
+                s.trim(size_t(a.sn_sel0), size_t(a.sn_sel1));
+                a.sn_sel0 = a.sn_sel1 = -1;
+                refresh(a);
+            }
+            return true;
+        case IDC_SN_EXPORT: {
+            if (s.current() < 0) return true;
+            const std::wstring p = file_dialog(true, L"Ton als WAV exportieren", L"WAV-Datei (*.wav)", L"*.wav", L"wav", L"kb" + std::to_wstring(s.current()) + L".wav", a.main);
+            if (p.empty()) return true;
+            const Bytes w = s.wav();
+            std::ofstream f(fs::path(p), std::ios::binary | std::ios::trunc);
+            f.write(reinterpret_cast<const char*>(w.data()), std::streamsize(w.size()));
+            s.set_status(f ? "Exportiert: " + fs::path(p).filename().string() : "Export fehlgeschlagen");
+            refresh(a);
+            return true;
+        }
+        case IDC_SN_IMPORT: {
+            if (s.current() < 0) return true;
+            const std::wstring p = file_dialog(false, L"WAV-Datei importieren", L"WAV-Datei (*.wav)", L"*.wav", nullptr, L"", a.main);
+            if (p.empty()) return true;
+            sound_stop();
+            em::VocFitOptions o;
+            switch (SendMessage(a.sn_ui.quality, CB_GETCURSEL, 0, 0)) {
+                case 1: o.max_rate = 11025; break;
+                case 2: o.max_rate = 8000; break;
+                case 3: o.max_rate = std::max(a.sn_orig_rate, o.min_rate); break;
+                default: o.max_rate = 16000; break;
+            }
+            o.normalize = SendMessage(a.sn_ui.norm, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            o.dither = SendMessage(a.sn_ui.dither, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            try {
+                const bool ok = s.import_wav(em::read_file(fs::path(p)), o);
+                a.sn_sel0 = a.sn_sel1 = -1;
+                if (ok && s.last_fit().trimmed) {
+                    TASKDIALOGCONFIG cfg{sizeof cfg};
+                    cfg.hwndParent = a.main;
+                    cfg.dwFlags = TDF_POSITION_RELATIVE_TO_WINDOW;
+                    cfg.dwCommonButtons = TDCBF_OK_BUTTON;
+                    cfg.pszWindowTitle = L"OpenEM Editor";
+                    cfg.pszMainIcon = TD_WARNING_ICON;
+                    cfg.pszMainInstruction = L"Der Ton ist zu lang für den Puffer des Spiels.";
+                    cfg.pszContent = L"Selbst bei der niedrigsten Abtastrate (4 kHz) passt er nicht hinein. Das Ende wurde abgeschnitten. Kürzere WAV-Dateien behalten eine höhere Qualität.";
+                    TaskDialogIndirect(&cfg, nullptr, nullptr, nullptr);
+                }
+            } catch (const std::exception& e) {
+                s.set_status(std::string("Import fehlgeschlagen: ") + e.what());
+            }
+            refresh(a);
+            return true;
+        }
+        default: return false;
+    }
+}
+
+// ------------------------------------------------------------------------------------ batch, mod packages, restore
+
+bool ask_dialog(App& a, const wchar_t* head, const std::wstring& content, const wchar_t* ok_label) {
+    TASKDIALOG_BUTTON buttons[] = {{101, ok_label}};
+    TASKDIALOGCONFIG cfg{sizeof cfg};
+    cfg.hwndParent = a.main;
+    cfg.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
+    cfg.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+    cfg.pszWindowTitle = L"OpenEM Editor";
+    cfg.pszMainIcon = TD_WARNING_ICON;
+    cfg.pszMainInstruction = head;
+    cfg.pszContent = content.c_str();
+    cfg.pButtons = buttons;
+    cfg.cButtons = 1;
+    cfg.nDefaultButton = 101;
+    int pressed = 0;
+    return SUCCEEDED(TaskDialogIndirect(&cfg, &pressed, nullptr, nullptr)) && pressed == 101;
+}
+
+void info_dialog(App& a, const wchar_t* head, const std::wstring& content, bool warning = false) {
+    TASKDIALOGCONFIG cfg{sizeof cfg};
+    cfg.hwndParent = a.main;
+    cfg.dwFlags = TDF_POSITION_RELATIVE_TO_WINDOW;
+    cfg.dwCommonButtons = TDCBF_OK_BUTTON;
+    cfg.pszWindowTitle = L"OpenEM Editor";
+    cfg.pszMainIcon = warning ? TD_WARNING_ICON : TD_INFORMATION_ICON;
+    cfg.pszMainInstruction = head;
+    cfg.pszContent = content.c_str();
+    TaskDialogIndirect(&cfg, nullptr, nullptr, nullptr);
+}
+
+// Reloads every document from disk after files were replaced from outside (restore, mod package, batch import)
+void reload_all(App& a) {
+    sound_stop();
+    if (a.ed->current() >= 0) a.ed->load(a.ed->current());
+    if (a.pal->current() >= 0) a.pal->load(a.pal->current());
+    if (a.map->current() >= 0) a.map->load(a.map->current());
+    a.team->load();
+    if (a.scene->loaded()) a.scene->load(a.scene->name());
+    if (a.sound->current() >= 0) open_sound(a, a.sound->current());
+    a.changes_rev = ~0u;
+    switch_tab(a, a.tab_index);
+}
+
+// Plain images (tab 0) or the goal scene sheets (tab 1) of the list
+std::vector<int> picture_numbers(App& a) {
+    std::vector<int> out;
+    for (const auto& f : a.ed->files())
+        if ((f.kind == PixelEditor::Kind::Image) == (a.tab_index == 0)) out.push_back(f.number);
+    return out;
+}
+
+void export_all(App& a) {
+    if (a.tab_index > 1) return;
+    const std::wstring dir = dialog_path(L"Ordner für die PNG-Dateien wählen", true, false, L"", a.main);
+    if (dir.empty()) return;
+    PixelEditor tmp(a.data);
+    int ok = 0, bad = 0;
+    for (int n : picture_numbers(a)) {
+        if (tmp.load(n) && export_png(fs::path(dir) / ("kb" + std::to_string(n) + ".png"), tmp.image(), tmp.palette())) ok++;
+        else bad++;
+    }
+    info_dialog(a, L"Export beendet", std::to_wstring(ok) + L" Bilder als kbNN.png nach\n" + dir + L" exportiert" + (bad ? L", " + std::to_wstring(bad) + L" fehlgeschlagen." : L"."), bad > 0);
+}
+
+void import_dir(App& a) {
+    if (a.tab_index > 1 || !confirm_discard(a)) return;
+    const std::wstring dir = dialog_path(L"Ordner mit kbNN.png-Dateien wählen", true, false, L"", a.main);
+    if (dir.empty()) return;
+    std::vector<int> found;
+    for (int n : picture_numbers(a))
+        if (fs::exists(fs::path(dir) / ("kb" + std::to_string(n) + ".png"))) found.push_back(n);
+    if (found.empty()) {
+        info_dialog(a, L"Nichts zu importieren", L"Im Ordner liegen keine Dateien kbNN.png zu den Bildern dieser Registerkarte.", true);
+        return;
+    }
+    if (!ask_dialog(a, (std::to_wstring(found.size()) + L" Bilder importieren?").c_str(), L"Die Dateien werden in die Spieldaten geschrieben (Sicherung als .bak). Jedes Pixel erhält die nächste Farbe der Palette. Die Größe muss mit dem Bild übereinstimmen.", L"Importieren"))
+        return;
+    PixelEditor tmp(a.data);
+    int ok = 0, approx_files = 0;
+    std::wstring problems;
+    for (int n : found) {
+        std::vector<uint32_t> px;
+        int w = 0, h = 0, approx = 0;
+        const std::wstring name = L"kb" + std::to_wstring(n) + L".png";
+        if (!tmp.load(n) || !load_argb(fs::path(dir) / name, px, w, h)) {
+            problems += name + L": nicht lesbar\n";
+        } else if (!tmp.import_argb(px, w, h, false, &approx)) {
+            problems += name + L": Größe " + std::to_wstring(w) + L" × " + std::to_wstring(h) + L" passt nicht\n";
+        } else if (!tmp.save()) {
+            problems += name + L": Speichern fehlgeschlagen\n";
+        } else {
+            ok++;
+            approx_files += approx > 0;
+        }
+    }
+    reload_all(a);
+    std::wstring text = std::to_wstring(ok) + L" von " + std::to_wstring(found.size()) + L" Bildern importiert";
+    if (approx_files) text += L"; bei " + std::to_wstring(approx_files) + L" davon mussten Farben der Palette angenähert werden.";
+    if (!problems.empty()) text += L"\n\nNicht importiert:\n" + problems;
+    info_dialog(a, L"Import beendet", text, !problems.empty());
+}
+
+void modpack_create(App& a) {
+    const auto files = em::editor::changed_files(a.data);
+    if (files.empty()) {
+        info_dialog(a, L"Keine Änderungen", L"Es gibt keine Datei, die sich von ihrer Sicherung (.bak) unterscheidet.");
+        return;
+    }
+    const std::wstring p = file_dialog(true, L"Mod-Paket speichern", L"ZIP-Datei (*.zip)", L"*.zip", L"zip", L"em_mod.zip", a.main);
+    if (p.empty()) return;
+    std::string err;
+    const size_t n = em::editor::create_modpack(a.data, fs::path(p), &err);
+    std::wstring list;
+    for (size_t i = 0; i < files.size() && i < 12; i++) list += widen(files[i].path) + L"\n";
+    if (files.size() > 12) list += L"… und " + std::to_wstring(files.size() - 12) + L" weitere\n";
+    if (n) info_dialog(a, (std::to_wstring(n) + L" Dateien im Mod-Paket").c_str(), widen(fs::path(p).filename().string()) + L":\n\n" + list);
+    else info_dialog(a, L"Mod-Paket nicht erstellt", widen(err), true);
+}
+
+void modpack_apply(App& a) {
+    if (!confirm_discard(a)) return;
+    const std::wstring p = file_dialog(false, L"Mod-Paket einspielen", L"ZIP-Datei (*.zip)", L"*.zip", nullptr, L"", a.main);
+    if (p.empty()) return;
+    em::editor::ZipEntries entries;
+    try {
+        entries = em::editor::read_zip(em::read_file(fs::path(p)));
+    } catch (const std::exception& e) {
+        info_dialog(a, L"Paket nicht lesbar", widen(e.what()), true);
+        return;
+    }
+    std::wstring list;
+    for (size_t i = 0; i < entries.size() && i < 12; i++) list += widen(entries[i].first) + L"\n";
+    if (entries.size() > 12) list += L"… und " + std::to_wstring(entries.size() - 12) + L" weitere\n";
+    if (!ask_dialog(a, (std::to_wstring(entries.size()) + L" Dateien einspielen?").c_str(), L"Sie ersetzen die Dateien im Spieleordner (von jeder bisherigen Datei bleibt eine Sicherung .bak, falls noch keine da ist):\n\n" + list, L"Einspielen"))
+        return;
+    std::string err;
+    const int n = em::editor::apply_modpack(a.data, fs::path(p), &err);
+    if (n < 0) {
+        info_dialog(a, L"Paket nicht eingespielt", widen(err), true);
+        return;
+    }
+    reload_all(a);
+    info_dialog(a, (std::to_wstring(n) + L" Dateien eingespielt").c_str(), L"Der Editor hat alles neu geladen.");
+}
+
+// KB/80.vga or TORE/2.at of the open document
+std::string current_rel_path(App& a) {
+    if (scene_tab(a)) return a.scene->loaded() ? "TORE/" + a.scene->name() : "";
+    if (sound_tab(a)) return a.sound->current() >= 0 ? "KB/" + std::to_string(a.sound->current()) + ".vga" : "";
+    if (team_tab(a)) return "KB/23.vga";
+    const int n = map_tab(a) ? a.map->current() : pal_tab(a) ? a.pal->current() : a.ed->current();
+    return n >= 0 ? "KB/" + std::to_string(n) + ".vga" : "";
+}
+
+void restore_current(App& a) {
+    const std::string rel = current_rel_path(a);
+    if (rel.empty()) return;
+    fs::path bak = a.data / rel;
+    bak += ".bak";
+    std::error_code ec;
+    if (!fs::exists(bak, ec)) {
+        info_dialog(a, L"Keine Sicherung", widen(rel) + L" wurde vom Editor noch nie überschrieben, es gibt kein .bak. Die Datei ist unverändert.");
+        return;
+    }
+    if (!confirm_discard(a)) return;
+    if (!ask_dialog(a, (widen(rel) + L" auf das Original zurücksetzen?").c_str(), L"Die Datei wird durch die Sicherung (.bak) ersetzt, alle Änderungen daran gehen verloren.", L"Zurücksetzen")) return;
+    if (!em::editor::restore_file(a.data, rel)) {
+        info_dialog(a, L"Zurücksetzen fehlgeschlagen", widen(rel), true);
+        return;
+    }
+    reload_all(a);
+}
+
+void new_scene(App& a) {
+    if (!scene_tab(a) || !a.scene->loaded() || !confirm_discard(a)) return;
+    const std::string from = a.scene->name();
+    if (!ask_dialog(a, L"Neue Szene anlegen?", L"Die vier Skripte (Heim/Gast, Tor/vergebene Chance) der Szene " + SceneDoc::describe(from) + L" werden unter der nächsten freien Nummer kopiert und TORE\\anzahl wird erhöht, damit das Spiel die neue Szene auch auswählt. Danach lässt sie sich bearbeiten.", L"Anlegen"))
+        return;
+    const int n = a.scene->add_scene_set(from);
+    if (n < 0) {
+        info_dialog(a, L"Neue Szene nicht angelegt", widen(a.scene->status()), true);
+        return;
+    }
+    const size_t dot = from.find('.');
+    const std::string created = std::to_string(n) + from.substr(dot);
+    fill_list(a);
+    for (size_t i = 0; i < a.sc_names.size(); i++)
+        if (a.sc_names[i] == created) open_scene(a, int(i));
+    select_in_list(a, int(std::find(a.sc_names.begin(), a.sc_names.end(), created) - a.sc_names.begin()));
+    refresh(a);
+}
+
+// Copy, cut, paste, delete, select all, flip, rotate of the image canvas
+void image_edit_command(App& a, UINT id) {
+    PixelEditor& e = *a.ed;
+    if (e.current() < 0 || a.tab_index > 1) return;
+    switch (id) {
+        case ID_EDIT_COPY: e.copy(); break;
+        case ID_EDIT_CUT: e.cut(); break;
+        case ID_EDIT_PASTE: e.paste(a.hover_x >= 0 ? a.hover_x : 0, a.hover_y >= 0 ? a.hover_y : 0); break;
+        case ID_EDIT_DELETE: e.delete_selection(); break;
+        case ID_EDIT_SELECTALL: e.select_all(); break;
+        case ID_EDIT_FLIPH: e.flip(true); break;
+        case ID_EDIT_FLIPV: e.flip(false); break;
+        case ID_EDIT_ROTATE: e.rotate_cw(); break;
+        default: break;
+    }
 }
 
 // ------------------------------------------------------------------------------------------ palette editor
@@ -2635,20 +3369,41 @@ void build_menu(HWND hwnd) {
     AppendMenuW(file, MF_STRING, ID_FILE_SAVE, L"&Speichern\tStrg+S");
     AppendMenuW(file, MF_STRING, ID_FILE_IMPORT, L"Bild &importieren…	Strg+I");
     AppendMenuW(file, MF_STRING, ID_FILE_EXPORT, L"Bild &exportieren… (PNG, BMP)	Strg+E");
+    AppendMenuW(file, MF_STRING, ID_FILE_EXPORTALL, L"&Alle Bilder exportieren…");
+    AppendMenuW(file, MF_STRING, ID_FILE_IMPORTDIR, L"Bilder aus &Ordner importieren…");
+    AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(file, MF_STRING, ID_FILE_NEWSCENE, L"&Neue Szene anlegen…");
+    AppendMenuW(file, MF_STRING, ID_FILE_RESTORE, L"Datei auf &Original zurücksetzen…");
+    AppendMenuW(file, MF_STRING, ID_FILE_MODPACK, L"&Mod-Paket erstellen…");
+    AppendMenuW(file, MF_STRING, ID_FILE_MODAPPLY, L"Mod-Paket e&inspielen…");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, ID_FILE_EXIT, L"&Beenden\tAlt+F4");
     AppendMenuW(edit, MF_STRING, ID_EDIT_UNDO, L"&Rückgängig\tStrg+Z");
     AppendMenuW(edit, MF_STRING, ID_EDIT_REDO, L"&Wiederholen\tStrg+Y");
+    AppendMenuW(edit, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(edit, MF_STRING, ID_EDIT_CUT, L"&Ausschneiden\tStrg+X");
+    AppendMenuW(edit, MF_STRING, ID_EDIT_COPY, L"&Kopieren\tStrg+C");
+    AppendMenuW(edit, MF_STRING, ID_EDIT_PASTE, L"&Einfügen\tStrg+V");
+    AppendMenuW(edit, MF_STRING, ID_EDIT_DELETE, L"&Löschen\tEntf");
+    AppendMenuW(edit, MF_STRING, ID_EDIT_SELECTALL, L"A&lles auswählen\tStrg+A");
+    AppendMenuW(edit, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(edit, MF_STRING, ID_EDIT_FLIPH, L"Horizontal &spiegeln");
+    AppendMenuW(edit, MF_STRING, ID_EDIT_FLIPV, L"&Vertikal spiegeln");
+    AppendMenuW(edit, MF_STRING, ID_EDIT_ROTATE, L"Um 90° &drehen");
     AppendMenuW(tool, MF_STRING, ID_TOOL_PENCIL, L"&Stift\tP");
     AppendMenuW(tool, MF_STRING, ID_TOOL_LINE, L"&Linie\tL");
     AppendMenuW(tool, MF_STRING, ID_TOOL_RECT, L"&Rechteck\tR");
     AppendMenuW(tool, MF_STRING, ID_TOOL_FILLRECT, L"&Gefülltes Rechteck\tB");
     AppendMenuW(tool, MF_STRING, ID_TOOL_FILL, L"&Füllen\tF");
     AppendMenuW(tool, MF_STRING, ID_TOOL_PICKER, L"&Pipette\tI");
+    AppendMenuW(tool, MF_STRING, ID_TOOL_SELECT, L"&Auswahl\tM");
     AppendMenuW(view, MF_STRING, ID_VIEW_GRID, L"&Raster\tG");
     AppendMenuW(view, MF_STRING, ID_VIEW_FIT, L"Größe &anpassen");
     AppendMenuW(view, MF_STRING, ID_VIEW_ZOOMIN, L"&Vergrößern\t+");
     AppendMenuW(view, MF_STRING, ID_VIEW_ZOOMOUT, L"&Verkleinern\t-");
+    AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(view, MF_STRING, ID_VIEW_DEVIATION, L"&Palettenabweichung des Imports zeigen");
+    AppendMenuW(view, MF_STRING, ID_VIEW_CHANGES, L"Änderungen gegenüber dem &Original zeigen");
     AppendMenuW(help, MF_STRING, ID_HELP_ABOUT, L"&Info");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)file, L"&Datei");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)edit, L"&Bearbeiten");
@@ -2677,7 +3432,7 @@ void build_toolbar(App& a) {
     TBBUTTON bs[] = {
         btn(ID_TOOL_PENCIL, L"Stift", BTNS_CHECKGROUP),      btn(ID_TOOL_LINE, L"Linie", BTNS_CHECKGROUP),
         btn(ID_TOOL_RECT, L"Rechteck", BTNS_CHECKGROUP),     btn(ID_TOOL_FILLRECT, L"Gefüllt", BTNS_CHECKGROUP),
-        btn(ID_TOOL_FILL, L"Füllen", BTNS_CHECKGROUP),       btn(ID_TOOL_PICKER, L"Pipette", BTNS_CHECKGROUP),
+        btn(ID_TOOL_FILL, L"Füllen", BTNS_CHECKGROUP),       btn(ID_TOOL_PICKER, L"Pipette", BTNS_CHECKGROUP), btn(ID_TOOL_SELECT, L"Auswahl", BTNS_CHECKGROUP),
         sep(),
         btn(ID_EDIT_UNDO, L"Rückgängig", BTNS_BUTTON),       btn(ID_EDIT_REDO, L"Wiederholen", BTNS_BUTTON),
         sep(),
@@ -2705,14 +3460,15 @@ void command(App& a, UINT id) {
     PixelEditor& e = *a.ed;
     switch (id) {
         case ID_FILE_SAVE:
-            if (scene_tab(a)) a.scene->save();
+            if (sound_tab(a)) a.sound->save();
+            else if (scene_tab(a)) a.scene->save();
             else if (map_tab(a)) a.map->save();
             else if (team_tab(a)) team_save(a);
             else if (pal_tab(a)) a.pal->save();
             else e.save();
             break;
         case ID_FILE_EXPORT: {
-            if (e.current() < 0 || pal_tab(a) || team_tab(a) || map_tab(a) || scene_tab(a)) break;
+            if (e.current() < 0 || pal_tab(a) || team_tab(a) || map_tab(a) || scene_tab(a) || sound_tab(a)) break;
             const std::wstring p = image_dialog(true, L"kb" + std::to_wstring(e.current()) + L".png", a.main);
             if (p.empty()) break;
             const fs::path path(p);
@@ -2723,7 +3479,7 @@ void command(App& a, UINT id) {
             break;
         }
         case ID_FILE_IMPORT: {
-            if (e.current() < 0 || pal_tab(a) || team_tab(a) || map_tab(a) || scene_tab(a)) break;
+            if (e.current() < 0 || pal_tab(a) || team_tab(a) || map_tab(a) || scene_tab(a) || sound_tab(a)) break;
             const std::wstring p = image_dialog(false, L"", a.main);
             if (p.empty()) break;
             std::vector<uint32_t> px;
@@ -2750,29 +3506,45 @@ void command(App& a, UINT id) {
                 if (FAILED(TaskDialogIndirect(&cfg, &pressed, nullptr, nullptr)) || pressed != 101) break;
                 resize = true;
             }
-            if (e.import_argb(px, w, h, resize)) fit_zoom(a);
+            if (e.import_argb(px, w, h, resize)) {
+                fit_zoom(a);
+                a.view_deviation = e.last_import().approximated > 0;  // show where colours had to be approximated
+            }
             break;
         }
         case ID_FILE_EXIT: SendMessage(a.main, WM_CLOSE, 0, 0); return;
         case ID_EDIT_UNDO:
-            if (scene_tab(a)) { scene_stop(a); a.scene->undo(); }
+            if (sound_tab(a)) { sound_stop(); a.sound->revert(); sync_sound(a); }  // sounds: discard all changes
+            else if (scene_tab(a)) { scene_stop(a); a.scene->undo(); }
             else if (map_tab(a)) a.map->undo();
             else if (team_tab(a)) { a.team->revert(); fill_list(a); select_in_list(a, a.team_sel); load_team_controls(a); }  // teams: discard all changes
             else if (pal_tab(a)) { a.pal->revert(); sync_sliders(a); }  // palettes: discard all changes
             else e.undo();
             break;
         case ID_EDIT_REDO:
+            if (sound_tab(a)) break;
             if (scene_tab(a)) { scene_stop(a); a.scene->redo(); }
             else if (map_tab(a)) a.map->redo();
             else e.redo();
             break;
-        case ID_TOOL_PENCIL: case ID_TOOL_LINE: case ID_TOOL_RECT: case ID_TOOL_FILLRECT: case ID_TOOL_FILL: case ID_TOOL_PICKER:
+        case ID_TOOL_PENCIL: case ID_TOOL_LINE: case ID_TOOL_RECT: case ID_TOOL_FILLRECT: case ID_TOOL_FILL: case ID_TOOL_PICKER: case ID_TOOL_SELECT:
             e.set_tool(PixelEditor::Tool(id - ID_TOOL_PENCIL));
             break;
         case ID_VIEW_GRID: a.grid = !a.grid; InvalidateRect(a.canvas, nullptr, FALSE); break;
         case ID_VIEW_FIT: fit_zoom(a); InvalidateRect(a.canvas, nullptr, FALSE); break;
         case ID_VIEW_ZOOMIN: if (map_tab(a)) set_map_zoom(a, a.map_zoom + 1); else set_zoom(a, a.zoom + 1); return;
         case ID_VIEW_ZOOMOUT: if (map_tab(a)) set_map_zoom(a, a.map_zoom - 1); else set_zoom(a, a.zoom - 1); return;
+        case ID_EDIT_COPY: case ID_EDIT_CUT: case ID_EDIT_PASTE: case ID_EDIT_DELETE: case ID_EDIT_SELECTALL: case ID_EDIT_FLIPH: case ID_EDIT_FLIPV: case ID_EDIT_ROTATE:
+            image_edit_command(a, id);
+            break;
+        case ID_FILE_EXPORTALL: export_all(a); break;
+        case ID_FILE_IMPORTDIR: import_dir(a); break;
+        case ID_FILE_MODPACK: modpack_create(a); break;
+        case ID_FILE_MODAPPLY: modpack_apply(a); break;
+        case ID_FILE_RESTORE: restore_current(a); break;
+        case ID_FILE_NEWSCENE: new_scene(a); break;
+        case ID_VIEW_DEVIATION: a.view_deviation = !a.view_deviation; InvalidateRect(a.canvas, nullptr, FALSE); break;
+        case ID_VIEW_CHANGES: a.view_changes = !a.view_changes; a.changes_rev = ~0u; InvalidateRect(a.canvas, nullptr, FALSE); break;
         case ID_HELP_ABOUT:
             MessageBoxW(a.main, L"OpenEM Editor\nBilder des Eishockey Manager (1993) bearbeiten.\n\nTeil von OpenEM (GPL-3.0).", L"Info", MB_OK | MB_ICONINFORMATION);
             break;
@@ -2803,8 +3575,8 @@ LRESULT CALLBACK main_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 SendMessage(a.psel, CB_SETITEMDATA, WPARAM(i), n);
             }
             a.tab = CreateWindowExW(0, WC_TABCONTROLW, nullptr, WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_FIXEDWIDTH, 0, 0, 0, 0, h, (HMENU)IDC_TAB, a.inst, nullptr);
-            const wchar_t* tabs[] = {L"Bilder", L"Torszenen", L"Paletten", L"Mannschaften", L"Hallenkarten", L"Spielszenen"};
-            for (int i = 0; i < 6; i++) {
+            const wchar_t* tabs[] = {L"Bilder", L"Torszenen", L"Paletten", L"Mannschaften", L"Hallenkarten", L"Spielszenen", L"Töne"};
+            for (int i = 0; i < 7; i++) {
                 TCITEMW ti{TCIF_TEXT};
                 ti.pszText = const_cast<wchar_t*>(tabs[i]);
                 TabCtrl_InsertItem(a.tab, i, &ti);
@@ -2828,6 +3600,7 @@ LRESULT CALLBACK main_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessage(a.mu.mirror, WM_SETFONT, (WPARAM)a.font, TRUE);
             SendMessage(a.mu.lbl, WM_SETFONT, (WPARAM)a.font, TRUE);
             create_scene_controls(a);
+            create_sound_controls(a);
             init_list(a);
             return 0;
         }
@@ -2853,6 +3626,14 @@ LRESULT CALLBACK main_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (id == IDC_LIST) return 0;
             if (id >= IDC_SC_LIST && id <= IDC_SC_DEL) {
                 scene_command(a, id, code);
+                return 0;
+            }
+            if (id >= IDC_SC_RTO && id <= IDC_SC_AWAY) {
+                scene_route_command(a, id, code);
+                return 0;
+            }
+            if (id >= IDC_SN_PLAY && id <= IDC_SN_TRIM) {
+                sound_command(a, id, code);
                 return 0;
             }
             if (id == IDC_CLUB || (id >= IDC_NAME0 && id < IDC_NAME0 + 25) || id == IDC_CREST || id == IDC_PLACE || (id >= IDC_STR0 && id < IDC_STR0 + 3)) {
@@ -2926,7 +3707,7 @@ LRESULT CALLBACK main_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 if (HWND(lp) == a.tu.jer[i]) team_jersey_changed(a);
             }
             return 0;
-        case WM_SETFOCUS: SetFocus(scene_tab(a) ? a.su.view : map_tab(a) ? a.mu.view : pal_tab(a) ? a.pgrid : a.canvas); return 0;
+        case WM_SETFOCUS: SetFocus(sound_tab(a) ? a.sn_ui.view : scene_tab(a) ? a.su.view : map_tab(a) ? a.mu.view : pal_tab(a) ? a.pgrid : a.canvas); return 0;
         case WM_CLOSE:
             if (confirm_discard(a)) DestroyWindow(h);
             return 0;
@@ -3035,6 +3816,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         app.crest_ed = std::make_unique<PixelEditor>(data);
         app.map = std::make_unique<MapDoc>(data);
         app.scene = std::make_unique<SceneDoc>(data);
+        app.sound = std::make_unique<SoundDoc>(data);
         app.team = std::make_unique<TeamDoc>(data);
         app.team->load();
         app.data = data;
@@ -3071,6 +3853,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     RegisterClassExW(&wc);
     wc.lpszClassName = kSceneClass;
     wc.lpfnWndProc = scene_proc;
+    RegisterClassExW(&wc);
+    wc.lpszClassName = kWaveClass;
+    wc.lpfnWndProc = wave_proc;
     RegisterClassExW(&wc);
     wc.lpszClassName = kPickerClass;
     wc.lpfnWndProc = picker_proc;
@@ -3132,7 +3917,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         {FCONTROL | FVIRTKEY, 'S', ID_FILE_SAVE},   {FCONTROL | FVIRTKEY, 'E', ID_FILE_EXPORT}, {FCONTROL | FVIRTKEY, 'I', ID_FILE_IMPORT}, {FCONTROL | FVIRTKEY, 'Z', ID_EDIT_UNDO},
         {FCONTROL | FVIRTKEY, 'Y', ID_EDIT_REDO},   {FVIRTKEY, 'P', ID_TOOL_PENCIL},           {FVIRTKEY, 'L', ID_TOOL_LINE},
         {FVIRTKEY, 'R', ID_TOOL_RECT},              {FVIRTKEY, 'B', ID_TOOL_FILLRECT},          {FVIRTKEY, 'F', ID_TOOL_FILL},
-        {FVIRTKEY, 'I', ID_TOOL_PICKER},            {FVIRTKEY, 'G', ID_VIEW_GRID},              {FVIRTKEY, VK_ADD, ID_VIEW_ZOOMIN},
+        {FVIRTKEY, 'I', ID_TOOL_PICKER},            {FVIRTKEY, 'M', ID_TOOL_SELECT},            {FCONTROL | FVIRTKEY, 'C', ID_EDIT_COPY},   {FCONTROL | FVIRTKEY, 'X', ID_EDIT_CUT},
+        {FCONTROL | FVIRTKEY, 'V', ID_EDIT_PASTE},  {FVIRTKEY, VK_DELETE, ID_EDIT_DELETE},     {FCONTROL | FVIRTKEY, 'A', ID_EDIT_SELECTALL},            {FVIRTKEY, 'G', ID_VIEW_GRID},              {FVIRTKEY, VK_ADD, ID_VIEW_ZOOMIN},
         {FVIRTKEY, VK_OEM_PLUS, ID_VIEW_ZOOMIN},    {FVIRTKEY, VK_SUBTRACT, ID_VIEW_ZOOMOUT},   {FVIRTKEY, VK_OEM_MINUS, ID_VIEW_ZOOMOUT},
     };
     HACCEL accel = CreateAcceleratorTableW(keys, int(sizeof keys / sizeof keys[0]));
@@ -3151,7 +3937,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         // plain letter and plus/minus accelerators must not swallow text typed into an edit field
         wchar_t cls[16] = {};
         GetClassNameW(GetFocus(), cls, 16);
-        const bool typing = lstrcmpiW(cls, L"EDIT") == 0 && !(GetKeyState(VK_CONTROL) & 0x8000);
+        const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0, edit_keys = msg.message == WM_KEYDOWN && (msg.wParam == 'C' || msg.wParam == 'X' || msg.wParam == 'V' || msg.wParam == 'A' || msg.wParam == 'Z' || msg.wParam == 'Y');
+        const bool typing = lstrcmpiW(cls, L"EDIT") == 0 && (!ctrl || edit_keys);  // an edit field keeps its own copy, paste, select all and undo
         if (typing || !TranslateAccelerator(hwnd, accel, &msg)) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
