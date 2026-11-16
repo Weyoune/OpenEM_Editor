@@ -2,6 +2,8 @@
 #include "editor/scene_doc.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 
@@ -359,6 +361,109 @@ void SceneDoc::move_to(int n, int subject, int x, int y, bool keep_later) {
             }
         }
     });
+}
+
+bool SceneDoc::route(int subject, int n0, int n1, int x, int y, bool keep_later) {
+    if (!loaded() || subject < 0 || subject >= kSubjects || n0 < 0 || n1 <= n0 || n1 > frames()) return false;
+    const ScenePoint p0 = position(n0, subject), old_end = position(n1, subject);
+    const ScenePoint old_next = n1 < frames() ? position(n1 + 1, subject) : ScenePoint{};
+    x = std::clamp(x, 0, 0xFFFF);
+    y = std::clamp(y, 0, 0xFFFF);
+    const int k = n1 - n0, dx = x - p0.x, dy = y - p0.y;
+    std::vector<int> sx(static_cast<size_t>(k), 0), sy(static_cast<size_t>(k), 0);
+    int px = 0, py = 0;
+    for (int i = 1; i <= k; i++) {
+        const int cx = int(std::lround(double(dx) * i / k)), cy = int(std::lround(double(dy) * i / k));
+        sx[size_t(i - 1)] = cx - px;
+        sy[size_t(i - 1)] = cy - py;
+        px = cx;
+        py = cy;
+        if (std::abs(sx[size_t(i - 1)]) > 7 || std::abs(sy[size_t(i - 1)]) > 7) {
+            status_ = "Bahn: zu weit für " + std::to_string(k) + " Bilder (höchstens 7 Pixel je Bild und Achse)";
+            return false;
+        }
+    }
+    (void)old_end;
+    const TorScene before = scene_;
+        for (int i = 0; i < k; i++) move_byte(scene_.frames[size_t(n0 + i)], subject) = uint8_t(encode_move(sx[size_t(i)], sy[size_t(i)]));
+        if (keep_later && n1 < frames()) {
+            const int ndx = old_next.x - x, ndy = old_next.y - y;
+            if (std::abs(ndx) <= 7 && std::abs(ndy) <= 7) move_byte(scene_.frames[size_t(n1)], subject) = uint8_t(encode_move(ndx, ndy));
+        }
+    if (same_scene(before, scene_)) return true;
+    if (in_stroke_) {
+        stroke_changed_ = true;
+    } else {
+        undo_.push_back(before);
+        if (undo_.size() > 200) undo_.erase(undo_.begin());
+        redo_.clear();
+    }
+    changed();
+    return true;
+}
+
+bool SceneDoc::smooth(int subject, int n0, int n1) {
+    if (n1 <= n0 || n1 > frames()) return false;
+    const ScenePoint end = position(n1, subject);
+    return route(subject, n0, n1, end.x, end.y, false);
+}
+
+void SceneDoc::set_shirt_jersey(int side, unsigned col) {
+    const auto expand = [](unsigned v) { return uint8_t(((v & 63) << 2) | ((v & 63) >> 4)); };
+    set_shirt(side, expand((col >> 6) & 63), expand((col >> 2) & 63), expand((col << 2) & 63));
+}
+
+bool SceneDoc::read_scene_counts(const fs::path& data, int counts[3]) {
+    try {
+        const Bytes b = read_file(data / "TORE" / "anzahl");
+        const std::string s(b.begin(), b.end());
+        return std::sscanf(s.c_str(), "MAXSZENE:%d|%d|%d", &counts[0], &counts[1], &counts[2]) == 3;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+int SceneDoc::add_scene_set(const std::string& from) {
+    int n;
+    char side, kind, variant;
+    if (!parse_name(from, n, side, kind, variant)) {
+        status_ = "Neue Szene: unbekannter Dateiname " + from;
+        return -1;
+    }
+    int counts[3];
+    if (!read_scene_counts(data_, counts)) {
+        status_ = "Neue Szene: TORE\\anzahl fehlt oder ist unlesbar";
+        return -1;
+    }
+    const int slot = variant == 0 ? 0 : variant == 'e' ? 1 : 2;
+    const int number = counts[slot] + 1;
+    try {
+        // all four scripts of the source number must exist, otherwise the game would not find one of them
+        std::vector<std::pair<fs::path, fs::path>> copies;
+        for (char sd : {'h', 'a'})
+            for (char kd : {'t', 'v'}) {
+                const std::string src = std::to_string(n) + "." + sd + kd + (variant ? std::string(1, variant) : ""), dst = std::to_string(number) + "." + sd + kd + (variant ? std::string(1, variant) : "");
+                if (!fs::exists(data_ / "TORE" / src)) throw std::runtime_error("TORE\\" + src + " fehlt");
+                if (fs::exists(data_ / "TORE" / dst)) throw std::runtime_error("TORE\\" + dst + " gibt es schon");
+                copies.emplace_back(data_ / "TORE" / src, data_ / "TORE" / dst);
+            }
+        const fs::path anzahl = data_ / "TORE" / "anzahl";
+        fs::path bak = anzahl;
+        bak += ".bak";
+        std::error_code ec;
+        if (!fs::exists(bak, ec)) fs::copy_file(anzahl, bak, ec);
+        for (const auto& [a, b] : copies) fs::copy_file(a, b);
+        counts[slot] = number;
+        const std::string text = "MAXSZENE:" + std::to_string(counts[0]) + "|" + std::to_string(counts[1]) + "|" + std::to_string(counts[2]) + "\n";
+        std::ofstream f(anzahl, std::ios::binary | std::ios::trunc);
+        f << text;
+        if (!f) throw std::runtime_error("Schreiben von TORE\\anzahl fehlgeschlagen");
+        status_ = "Neue Szene " + std::to_string(number) + ": vier Skripte angelegt, TORE\\anzahl auf " + text.substr(0, text.size() - 1);
+        return number;
+    } catch (const std::exception& e) {
+        status_ = std::string("Neue Szene: ") + e.what();
+        return -1;
+    }
 }
 
 void SceneDoc::set_sprite(int n, int object, int sprite, bool to_end) {

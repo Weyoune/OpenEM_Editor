@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Format tests: encoders and decoders of the editor on synthetic data and (with the folder of the original game as
 // argument) on every original file: images, palettes, names, team tables and goal scene scripts must survive a round trip.
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 
@@ -8,6 +9,7 @@
 #include "formats/teamdata.hpp"
 #include "formats/tore.hpp"
 #include "formats/vga.hpp"
+#include "formats/voc.hpp"
 
 using namespace em;
 namespace fs = std::filesystem;
@@ -168,14 +170,74 @@ static void original_tore(const fs::path& em_dir) {
     std::printf("TORE: %d scripts\n", files);
 }
 
+// Sounds: VOC and WAV conversion, fitting into the buffer of the original file
+static void voc_tests() {
+    VocSound s;
+    s.sample_rate = voc_nearest_rate(8000);
+    for (int i = 0; i < 1000; i++) s.pcm.push_back(uint8_t(128 + 100 * std::sin(i * 0.1)));
+    Bytes enc = encode_voc(s);
+    CHECK(enc.size() == voc_file_size(1000, false));
+    VocSound back = decode_voc(enc);
+    CHECK(back.pcm == s.pcm && back.sample_rate == s.sample_rate && !back.loops);
+    s.loops = true;
+    enc = encode_voc(s);
+    CHECK(enc.size() == voc_file_size(1000, true) && decode_voc(enc).loops);
+    CHECK(voc_nearest_rate(8000) >= 7900 && voc_nearest_rate(8000) <= 8100 && voc_nearest_rate(1) == 3921);
+
+    // 16 bit stereo WAV: the channels are mixed down
+    Bytes wav{'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ', 16, 0, 0, 0, 1, 0, 2, 0, 0x44, 0xAC, 0, 0, 0x10, 0xB1, 2, 0, 4, 0, 16, 0, 'd', 'a', 't', 'a', 8, 0, 0, 0,
+              0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0xC0};  // (L, R) = (0.5, 0), (0.5, -0.5)
+    WavSound w = decode_wav(wav);
+    CHECK(w.sample_rate == 44100 && w.mono.size() == 2 && std::fabs(w.mono[0] - 0.25f) < 1e-3 && std::fabs(w.mono[1]) < 1e-3);
+
+    // fitting: a long 44.1 kHz tone into a small buffer lowers the rate, a short one keeps a high rate
+    WavSound tone;
+    tone.sample_rate = 44100;
+    for (int i = 0; i < 44100; i++) tone.mono.push_back(float(0.3 * std::sin(i * 0.05)));  // one second
+    VocFit big = fit_voc(tone, 20000, false);
+    CHECK(!big.trimmed && big.bytes <= 20000 && big.sound.sample_rate >= 11000 && big.sound.sample_rate <= 16000 && big.seconds_out > 0.99);
+    VocFit small = fit_voc(tone, 5000, false);
+    CHECK(!small.trimmed && small.bytes <= 5000 && small.sound.sample_rate < 5000 && small.sound.sample_rate >= 4000);
+    VocFit tiny = fit_voc(tone, 2000, false);
+    CHECK(tiny.trimmed && tiny.bytes <= 2000);
+    int peak = 0;
+    for (uint8_t v : big.sound.pcm) peak = std::max(peak, std::abs(int(v) - 128));
+    CHECK(peak >= 126 && !big.clipped);  // normalised to full scale
+    VocFitOptions raw;
+    raw.normalize = false;
+    VocFit quiet = fit_voc(tone, 20000, false, raw);
+    peak = 0;
+    for (uint8_t v : quiet.sound.pcm) peak = std::max(peak, std::abs(int(v) - 128));
+    CHECK(peak < 50 && quiet.gain == 1.0);
+    bool threw = false;
+    try { fit_voc(WavSound{}, 1000, false); } catch (const FormatError&) { threw = true; }
+    CHECK(threw);
+    CHECK(decode_voc(encode_wav8(s).empty() ? Bytes{} : encode_voc(fit_voc(decode_wav(encode_wav8(s)), 4000, false).sound)).pcm.size() > 0);
+}
+
+static void original_sounds(const fs::path& em_dir) {
+    for (int n = 237; n <= 241; n++) {
+        const Bytes d = read_file(em_dir / "KB" / (std::to_string(n) + ".vga"));
+        const VocSound v = decode_voc(d);
+        CHECK(v.sample_rate > 4000 && !v.pcm.empty() && v.loops == (n == 237));
+        CHECK(encode_voc(v) == d);  // the writer reproduces the original files
+        CHECK(voc_file_size(v.pcm.size(), v.loops) == d.size());
+        // a WAV round trip at the original rate fits the original buffer
+        const VocFit f = fit_voc(decode_wav(encode_wav8(v)), d.size(), v.loops);
+        CHECK(!f.trimmed && f.bytes <= d.size() && f.sound.sample_rate >= v.sample_rate - 50);
+    }
+}
+
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
         encoder_tests();
+        voc_tests();
         if (argc > 1) {
             original_kb(argv[1]);
             original_db(argv[1]);
             original_tore(argv[1]);
+            original_sounds(argv[1]);
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "exception: %s\n", e.what());

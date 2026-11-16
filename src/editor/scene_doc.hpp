@@ -71,6 +71,19 @@ public:
     void insert_frame(int n);     // after position n: no movement, same sprites, so the picture stays
     void duplicate_frame(int n);  // n >= 1: after frame n - 1 a copy of it (the movement repeats)
     void delete_frame(int n);     // n >= 1; later positions lose that frame's movement; the last frame stays
+    // Path from the current state of a subject: positions n0 + 1 .. n1 become even steps ending at (x, y) at position n1
+    // (n0 < n1; every step at most 7 pixels per axis, otherwise nothing changes and false is returned). With keep_later the
+    // step after n1 is adjusted so the path after n1 stays where it was. smooth() keeps both end points of n0..n1 and only
+    // evens out the steps between them.
+    bool route(int subject, int n0, int n1, int x, int y, bool keep_later = true);
+    bool smooth(int subject, int n0, int n1);
+    // Shirt colour of a team: the 12-bit value of KB23 (as the game turns it into DAC colours 254 / 253)
+    void set_shirt_jersey(int side, unsigned jersey);
+
+    // A new scene: copies the four scripts of the same number and variant as `from` (home / away x goal / chance) to the next free number and
+    // raises MAXSZENE in TORE\anzahl, so the game can pick it. Returns the new number or -1 (error text in status()).
+    int add_scene_set(const std::string& from);
+    static bool read_scene_counts(const std::filesystem::path& data, int counts[3]);  // MAXSZENE:a|b|c
     void stroke_begin();
     void stroke_end();
     void undo();

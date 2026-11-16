@@ -4,6 +4,7 @@
 #include "formats/tore.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <unordered_map>
@@ -26,6 +27,8 @@ constexpr SheetSpec kSheets[] = {
     {235, PixelEditor::Kind::Sprites, 32, 8, "Torhüter, Puck"},
 };
 constexpr int kPanelNumber = 246;
+
+PixelEditor::Rect normalized(int ax, int ay, int bx, int by) { return {std::min(ax, bx), std::min(ay, by), std::max(ax, bx), std::max(ay, by)}; }
 
 const SheetSpec* sheet_spec(int n) {
     for (const auto& s : kSheets)
@@ -125,8 +128,9 @@ void PixelEditor::close() {
     revision_++;
 }
 
-bool PixelEditor::load(int number) {
-    const fs::path p = kb_ / (std::to_string(number) + ".vga");
+bool PixelEditor::load(int number) { return load_file(kb_ / (std::to_string(number) + ".vga"), number); }
+
+bool PixelEditor::load_file(const fs::path& p, int number) {
     try {
         Bytes d = read_file(p);
         // palettes may have been edited since start-up
@@ -172,6 +176,10 @@ bool PixelEditor::load(int number) {
         current_ = number;
         dirty_ = false;
         drawing_ = false;
+        drag_ = Drag::None;
+        sel_valid_ = false;
+        deviation_.clear();
+        report_ = ImportReport();
         undo_.clear();
         redo_.clear();
         revision_++;
@@ -245,8 +253,11 @@ bool PixelEditor::import_argb(const std::vector<uint32_t>& argb, int w, int h, b
         return false;
     }
     std::vector<uint8_t> out(argb.size());
-    std::unordered_map<uint32_t, uint8_t> cache;
+    struct Hit { uint8_t index; int dist2; };
+    std::unordered_map<uint32_t, Hit> cache;
+    std::vector<uint8_t> dev(argb.size(), 0);
     int inexact = 0;
+    double sum = 0, worst = 0;
     for (size_t i = 0; i < argb.size(); i++) {
         const uint32_t v = argb[i];
         if ((v >> 24) < 128) { out[i] = 0; continue; }
@@ -264,13 +275,17 @@ bool PixelEditor::import_argb(const std::vector<uint32_t>& argb, int w, int h, b
                 const int d = (c[0] - r) * (c[0] - r) + (c[1] - g) * (c[1] - g) + (c[2] - b) * (c[2] - b);
                 if (d < bd) { bd = d; best = k; }
             }
-            it = cache.emplace(key, uint8_t(best)).first;
-            if (bd != 0) cache_inexact_.insert(key);
+            it = cache.emplace(key, Hit{uint8_t(best), bd}).first;
         }
-        out[i] = it->second;
-        if (cache_inexact_.count(key)) inexact++;
+        out[i] = it->second.index;
+        if (it->second.dist2 != 0) {
+            const double dist = std::sqrt(double(it->second.dist2));
+            inexact++;
+            sum += dist;
+            worst = std::max(worst, dist);
+            dev[i] = uint8_t(std::min(255.0, dist));
+        }
     }
-    cache_inexact_.clear();
     if (resize) {
         img_ = Image(w, h);
         undo_.clear();
@@ -279,10 +294,13 @@ bool PixelEditor::import_argb(const std::vector<uint32_t>& argb, int w, int h, b
         push_undo();
     }
     img_.pixels = std::move(out);
+    deviation_ = std::move(dev);
+    report_ = {int(argb.size()), inexact, worst, inexact ? sum / inexact : 0.0};
+    sel_valid_ = false;
     dirty_ = true;
     revision_++;
     if (approximated) *approximated = inexact;
-    status_ = "Importiert: " + std::to_string(w) + " × " + std::to_string(h) + (inexact ? ", " + std::to_string(inexact) + " Pixel der Palette angenähert" : ", Farben exakt");
+    status_ = "Importiert: " + std::to_string(w) + " × " + std::to_string(h) + (inexact ? ", " + std::to_string(inexact) + " Pixel der Palette angenähert (größte Abweichung " + std::to_string(int(worst + 0.5)) + " von 441)" : ", Farben exakt");
     return true;
 }
 
@@ -360,6 +378,31 @@ int PixelEditor::pick(int x, int y) const {
 
 void PixelEditor::stroke_begin(int x, int y) {
     if (current_ < 0 || x < 0 || y < 0 || x >= img_.width || y >= img_.height) return;
+    if (tool_ == Tool::Select) {
+        if (sel_valid_ && x >= sel_.x0 && x <= sel_.x1 && y >= sel_.y0 && y <= sel_.y1) {  // inside: lift the pixels and move them
+            push_undo();
+            base_ = img_.pixels;
+            float_.assign(size_t(sel_.width()) * sel_.height(), 0);
+            for (int row = 0; row < sel_.height(); row++)
+                for (int col = 0; col < sel_.width(); col++) {
+                    float_[size_t(row) * sel_.width() + size_t(col)] = img_.at(sel_.x0 + col, sel_.y0 + row);
+                    base_[size_t(sel_.y0 + row) * img_.width + size_t(sel_.x0 + col)] = 0;
+                }
+            sel_orig_ = sel_;
+            press_x_ = x;
+            press_y_ = y;
+            drag_ = Drag::Move;
+        } else {
+            anchor_x_ = x;
+            anchor_y_ = y;
+            sel_ = {x, y, x, y};
+            sel_valid_ = true;
+            drag_ = Drag::Select;
+        }
+        drawing_ = true;
+        revision_++;
+        return;
+    }
     if (tool_ == Tool::Picker) {
         color_ = img_.at(x, y);
         return;
@@ -383,6 +426,23 @@ void PixelEditor::stroke_move(int x, int y) {
     if (!drawing_) return;
     x = std::clamp(x, 0, img_.width - 1);
     y = std::clamp(y, 0, img_.height - 1);
+    if (drag_ == Drag::Select) {
+        sel_ = normalized(anchor_x_, anchor_y_, x, y);
+        revision_++;
+        return;
+    }
+    if (drag_ == Drag::Move) {
+        const int dx = x - press_x_, dy = y - press_y_, w = sel_orig_.width(), h = sel_orig_.height();
+        img_.pixels = base_;
+        for (int row = 0; row < h; row++)
+            for (int col = 0; col < w; col++) {
+                const int px = sel_orig_.x0 + dx + col, py = sel_orig_.y0 + dy + row;
+                if (px >= 0 && py >= 0 && px < img_.width && py < img_.height) img_.at(px, py) = float_[size_t(row) * w + size_t(col)];
+            }
+        sel_ = {sel_orig_.x0 + dx, sel_orig_.y0 + dy, sel_orig_.x0 + dx + w - 1, sel_orig_.y0 + dy + h - 1};
+        revision_++;
+        return;
+    }
     if (tool_ == Tool::Pencil) {
         draw_line(lx_, ly_, x, y, color_);
     } else {
@@ -398,11 +458,164 @@ void PixelEditor::stroke_move(int x, int y) {
 void PixelEditor::stroke_end() {
     if (!drawing_) return;
     drawing_ = false;
+    if (drag_ == Drag::Select) {
+        drag_ = Drag::None;
+        return;
+    }
+    if (drag_ == Drag::Move) {
+        drag_ = Drag::None;
+        if (sel_.x0 == sel_orig_.x0 && sel_.y0 == sel_orig_.y0) undo_.pop_back();  // not moved
+        else dirty_ = true;
+        return;
+    }
     if (img_.pixels == base_) {  // nothing changed: drop the snapshot
         undo_.pop_back();
         return;
     }
     dirty_ = true;
+}
+
+// ------------------------------------------------------------------------------------------------ selection
+
+void PixelEditor::select_all() {
+    if (current_ < 0) return;
+    sel_ = {0, 0, img_.width - 1, img_.height - 1};
+    sel_valid_ = true;
+    revision_++;
+}
+
+void PixelEditor::clear_selection() {
+    if (!sel_valid_) return;
+    sel_valid_ = false;
+    revision_++;
+}
+
+// The area an edit applies to: the selection, else the whole picture of a plain image
+bool PixelEditor::region(Rect& r, const char* what) {
+    if (current_ < 0) return false;
+    if (sel_valid_) {
+        r = sel_;
+        return true;
+    }
+    if (kind_ == Kind::Image) {
+        r = {0, 0, img_.width - 1, img_.height - 1};
+        return true;
+    }
+    status_ = std::string(what) + ": zuerst einen Bereich auswählen";
+    return false;
+}
+
+bool PixelEditor::copy() {
+    if (current_ < 0 || !sel_valid_) return false;
+    clip_ = Image(sel_.width(), sel_.height());
+    for (int y = 0; y < clip_.height; y++)
+        std::copy_n(img_.pixels.data() + size_t(sel_.y0 + y) * img_.width + size_t(sel_.x0), clip_.width, clip_.pixels.data() + size_t(y) * clip_.width);
+    status_ = "Kopiert: " + std::to_string(clip_.width) + " × " + std::to_string(clip_.height);
+    return true;
+}
+
+bool PixelEditor::delete_selection() {
+    if (current_ < 0 || !sel_valid_) return false;
+    push_undo();
+    for (int y = sel_.y0; y <= sel_.y1; y++)
+        std::fill_n(img_.pixels.data() + size_t(y) * img_.width + size_t(sel_.x0), sel_.width(), uint8_t(0));
+    dirty_ = true;
+    revision_++;
+    return true;
+}
+
+bool PixelEditor::cut() { return copy() && delete_selection(); }
+
+bool PixelEditor::paste(int x, int y) {
+    if (current_ < 0 || clip_.pixels.empty()) return false;
+    x = std::clamp(x, 0, std::max(0, img_.width - 1));
+    y = std::clamp(y, 0, std::max(0, img_.height - 1));
+    push_undo();
+    const int w = std::min(clip_.width, img_.width - x), h = std::min(clip_.height, img_.height - y);
+    for (int row = 0; row < h; row++)
+        std::copy_n(clip_.pixels.data() + size_t(row) * clip_.width, w, img_.pixels.data() + size_t(y + row) * img_.width + size_t(x));
+    sel_ = {x, y, x + w - 1, y + h - 1};
+    sel_valid_ = true;
+    dirty_ = true;
+    revision_++;
+    return true;
+}
+
+bool PixelEditor::flip(bool horizontal) {
+    Rect r;
+    if (!region(r, "Spiegeln")) return false;
+    push_undo();
+    const int w = r.width(), h = r.height();
+    std::vector<uint8_t> src(size_t(w) * h);
+    for (int y = 0; y < h; y++) std::copy_n(img_.pixels.data() + size_t(r.y0 + y) * img_.width + size_t(r.x0), w, src.data() + size_t(y) * w);
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) img_.at(r.x0 + x, r.y0 + y) = src[size_t(horizontal ? y : h - 1 - y) * w + size_t(horizontal ? w - 1 - x : x)];
+    dirty_ = true;
+    revision_++;
+    return true;
+}
+
+bool PixelEditor::rotate_cw() {
+    Rect r;
+    if (!region(r, "Drehen")) return false;
+    if (r.width() != r.height()) {
+        status_ = "Drehen: der Bereich muss quadratisch sein";
+        return false;
+    }
+    push_undo();
+    const int n = r.width();
+    std::vector<uint8_t> src(size_t(n) * n);
+    for (int y = 0; y < n; y++) std::copy_n(img_.pixels.data() + size_t(r.y0 + y) * img_.width + size_t(r.x0), n, src.data() + size_t(y) * n);
+    for (int y = 0; y < n; y++)
+        for (int x = 0; x < n; x++) img_.at(r.x0 + x, r.y0 + y) = src[size_t(n - 1 - x) * n + size_t(y)];
+    dirty_ = true;
+    revision_++;
+    return true;
+}
+
+// ------------------------------------------------------------------------------------------------ original
+
+bool PixelEditor::has_backup() const {
+    if (current_ < 0) return false;
+    fs::path bak = kb_ / (std::to_string(current_) + ".vga");
+    bak += ".bak";
+    std::error_code ec;
+    return fs::exists(bak, ec);
+}
+
+std::vector<uint8_t> PixelEditor::changed_pixels() const {
+    if (current_ < 0) return {};
+    const fs::path p = kb_ / (std::to_string(current_) + ".vga");
+    fs::path baseline = p;
+    baseline += ".bak";
+    std::error_code ec;
+    if (!fs::exists(baseline, ec)) baseline = p;
+    try {
+        PixelEditor other(kb_.parent_path());
+        if (!other.load_file(baseline, current_) || other.img_.width != img_.width || other.img_.height != img_.height) return {};
+        std::vector<uint8_t> out(img_.pixels.size());
+        for (size_t i = 0; i < out.size(); i++) out[i] = other.img_.pixels[i] != img_.pixels[i];
+        return out;
+    } catch (const std::exception&) {
+        return {};
+    }
+}
+
+bool PixelEditor::restore_original() {
+    if (!has_backup()) return false;
+    const int number = current_;
+    const fs::path p = kb_ / (std::to_string(number) + ".vga");
+    fs::path bak = p;
+    bak += ".bak";
+    std::error_code ec;
+    fs::copy_file(bak, p, fs::copy_options::overwrite_existing, ec);
+    if (ec) {
+        status_ = "Zurücksetzen fehlgeschlagen: " + ec.message();
+        return false;
+    }
+    const bool ok = load(number);
+    if (ok) status_ = "KB" + std::to_string(number) + " auf das Original zurückgesetzt";
+    return ok;
 }
 
 }  // namespace em::editor

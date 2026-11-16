@@ -2,11 +2,15 @@
 // Tests of the asset editor logic (no window): drawing tools, undo/redo, saving with backup.
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 
 #include "editor/palette_doc.hpp"
 #include "editor/map_doc.hpp"
+#include "editor/modpack.hpp"
 #include "editor/pixel_editor.hpp"
 #include "editor/scene_doc.hpp"
+#include "editor/sound_doc.hpp"
+#include "formats/voc.hpp"
 #include "editor/team_doc.hpp"
 #include "formats/tore.hpp"
 
@@ -176,6 +180,84 @@ int main(int argc, char** argv) {
         CHECK(ed.load(233) && !ed.import_argb(two, 2, 2, true));  // sheets must match exactly
     }
 
+    // selection, clipboard, flipping and rotating, deviation report, comparison with the original
+    {
+        using Tool = PixelEditor::Tool;
+        CHECK(ed.load(80));
+        const Image start = ed.image();
+        ed.set_tool(Tool::Select);
+        ed.stroke_begin(2, 2);
+        ed.stroke_move(9, 9);
+        ed.stroke_end();
+        CHECK(ed.has_selection() && ed.selection().x0 == 2 && ed.selection().x1 == 9 && ed.selection().width() == 8 && !ed.dirty() && ed.image().pixels == start.pixels);
+        CHECK(ed.copy() && ed.has_clipboard());
+        CHECK(ed.flip(true) && ed.image().at(2, 2) == start.pixels[size_t(2) * 38 + 9] && ed.image().at(9, 5) == start.pixels[size_t(5) * 38 + 2]);
+        CHECK(ed.flip(true) && ed.image().pixels == start.pixels);
+        CHECK(ed.flip(false) && ed.image().at(4, 2) == start.pixels[size_t(9) * 38 + 4]);
+        CHECK(ed.flip(false) && ed.image().pixels == start.pixels);
+        for (int i = 0; i < 4; i++) CHECK(ed.rotate_cw());
+        CHECK(ed.image().pixels == start.pixels);
+        CHECK(ed.rotate_cw() && ed.image().at(9, 2) == start.pixels[size_t(2) * 38 + 2]);  // top left corner turns to the top right
+        ed.undo();
+        // dragging inside the selection moves the pixels
+        ed.stroke_begin(5, 5);
+        ed.stroke_move(15, 7);
+        ed.stroke_end();
+        CHECK(ed.dirty() && ed.selection().x0 == 12 && ed.selection().y0 == 4);
+        CHECK(ed.image().at(12, 4) == start.pixels[size_t(2) * 38 + 2] && ed.image().at(2, 2) == 0);
+        ed.undo();
+        CHECK(ed.image().pixels == start.pixels);
+        // a click without movement is no edit
+        ed.stroke_begin(5, 5);
+        ed.stroke_end();
+        CHECK(!ed.can_undo() || ed.image().pixels == start.pixels);
+        // paste and delete
+        CHECK(ed.paste(20, 20) && ed.image().at(20, 20) == start.pixels[size_t(2) * 38 + 2] && ed.selection().x0 == 20);
+        CHECK(ed.delete_selection() && ed.image().at(22, 22) == 0);
+        ed.undo();
+        ed.undo();
+        CHECK(ed.image().pixels == start.pixels);
+        ed.clear_selection();
+        CHECK(!ed.has_selection() && ed.flip(true));  // plain image without selection: the whole picture
+        ed.undo();
+        ed.stroke_begin(0, 0);
+        ed.stroke_move(2, 5);  // 3 x 6: not square
+        ed.stroke_end();
+        CHECK(!ed.rotate_cw());
+        CHECK(ed.load(231) && !ed.flip(true) && !ed.has_selection());  // sheets need a selection
+        ed.select_all();
+        CHECK(ed.has_selection() && ed.selection().x1 == 255);
+        ed.set_tool(Tool::Pencil);
+
+        // deviation of an import
+        CHECK(ed.load(80));
+        std::vector<uint32_t> px(start.pixels.size());
+        for (size_t i = 0; i < px.size(); i++) {
+            const auto& c = ed.palette().rgb[start.pixels[i]];
+            px[i] = 0xFF000000u | uint32_t(c[0]) << 16 | uint32_t(c[1]) << 8 | c[2];
+        }
+        px[100] ^= 0x010000u;  // a colour one step off in red: snaps back to the same palette colour
+        int approx = 0;
+        CHECK(ed.import_argb(px, 38, 38, false, &approx) && approx == 1);
+        CHECK(ed.last_import().approximated == 1 && ed.last_import().worst > 0 && ed.last_import().worst <= 2 && ed.last_import().pixels == 38 * 38);
+        CHECK(ed.deviation().size() == px.size() && ed.deviation()[100] > 0 && ed.deviation()[99] == 0);
+        CHECK(ed.load(80) && ed.deviation().empty());
+
+        // comparison with the original: KB80 was edited and saved above, so a backup exists
+        CHECK(ed.has_backup());
+        const auto diff = ed.changed_pixels();
+        size_t changed = 0;
+        for (uint8_t v : diff) changed += v;
+        CHECK(diff.size() == px.size() && changed > 0);
+        CHECK(ed.restore_original() && !ed.dirty());
+        const Image orig80 = decode_vga(read_file(src / "KB" / "80.vga"));
+        CHECK(ed.image().pixels == orig80.pixels);
+        const auto none = ed.changed_pixels();
+        size_t after = 0;
+        for (uint8_t v : none) after += v;
+        CHECK(after == 0);
+    }
+
     // hall map editor
     {
         MapDoc md(tmp);
@@ -258,6 +340,33 @@ int main(int argc, char** argv) {
         CHECK(!re2.dirty() && re2.duplicate_names().size() == dups);
     }
 // European clubs (teams 64..149): name, jersey and strengths        TeamDoc eu(tmp);        CHECK(eu.load() && eu.club_name(64) == "KLAGENFURTER AC" && !TeamDoc::has_players(64) && TeamDoc::editable(149));        CHECK(eu.set_club_name(64, "hc test") && eu.club_name(64) == "HC TEST");        CHECK(!eu.set_club_name(64, "EIN VIEL ZU LANGER EUROPAEISCHER NAME"));        eu.set_strength(64, 0, 55);        eu.set_jersey(64, 1, 2, 3);        CHECK(eu.save());        TeamDoc eu2(tmp);        CHECK(eu2.load() && eu2.club_name(64) == "HC TEST" && eu2.club_name(65) == eu.club_name(65) && eu2.data(64).strength[0] == 55 && eu2.data(64).jersey == 0x0123);        eu2.swap_teams(64, 65);        CHECK(eu2.club_name(65) == "HC TEST" && eu2.data(65).strength[0] == 55);        eu2.swap_teams(0, 64);  // different groups: ignored        CHECK(eu2.club_name(64) != "EISBÄREN BERLIN");
+
+    // sound editor
+    {
+        for (int n = 237; n <= 241; n++) fs::copy_file(src / "KB" / (std::to_string(n) + ".vga"), tmp / "KB" / (std::to_string(n) + ".vga"), fs::copy_options::overwrite_existing);
+        SoundDoc so(tmp);
+        const Bytes orig = read_file(tmp / "KB" / "238.vga");
+        CHECK(so.load(238) && so.sound().sample_rate > 4000 && so.capacity() == orig.size() && !so.dirty());
+        CHECK(so.save() && read_file(tmp / "KB" / "238.vga") == orig);  // unchanged: identical file
+        WavSound tone;
+        tone.sample_rate = 44100;
+        for (int i = 0; i < 44100 * 2; i++) tone.mono.push_back(float(0.5 * std::sin(i * 0.03)));
+        VocSound ref;
+        ref.sample_rate = 44100;
+        for (float v : tone.mono) ref.pcm.push_back(uint8_t(128 + 120 * v));
+        CHECK(so.import_wav(encode_wav8(ref)) && so.dirty());
+        CHECK(so.file_size() <= so.capacity() && so.last_fit().trimmed && so.sound().sample_rate >= 4000);  // two seconds do not fit
+        CHECK(so.save() && fs::exists(tmp / "KB" / "238.vga.bak") && read_file(tmp / "KB" / "238.vga.bak") == orig);
+        CHECK(read_file(tmp / "KB" / "238.vga").size() <= orig.size());
+        SoundDoc re(tmp);
+        CHECK(re.load(238) && re.capacity() == orig.size() && re.sound().pcm == so.sound().pcm);  // the buffer stays the original size
+        so.revert();
+        CHECK(!so.dirty());
+        CHECK(!so.import_wav(Bytes{1, 2, 3}));
+        CHECK(so.load(237) && so.sound().loops && so.save());
+        so.trim(10, 20);
+        CHECK(so.sound().pcm.size() == 10 && so.dirty());
+    }
 
     // goal scene editor
     {
@@ -368,6 +477,98 @@ int main(int argc, char** argv) {
         CHECK(re.set_arena(1) && re.arena() == 1);
         re.set_shirt(0, 1, 2, 3);
         CHECK(re.palette().rgb[254][0] == 1);
+    }
+
+    // scenes: paths, smoothing, shirt colours, new scene sets
+    {
+        SceneDoc sd(tmp);
+        CHECK(sd.load("2.at"));
+        const Bytes before = encode_tor(sd.scene());
+        // a path of 10 frames to a point 50 pixels away: even steps of 5
+        const auto a = sd.position(20, 6);
+        CHECK(sd.route(6, 20, 30, a.x + 50, a.y - 30));
+        CHECK(sd.position(30, 6).x == a.x + 50 && sd.position(30, 6).y == a.y - 30);
+        for (int n = 21; n <= 30; n++) CHECK(std::abs(sd.position(n, 6).x - sd.position(n - 1, 6).x) <= 5 && std::abs(sd.position(n, 6).y - sd.position(n - 1, 6).y) <= 3);
+        sd.undo();
+        CHECK(encode_tor(sd.scene()) == before);
+        CHECK(!sd.route(6, 20, 22, a.x + 100, a.y));
+        CHECK(encode_tor(sd.scene()) == before);  // too far for two frames: nothing changed
+        const auto e0 = sd.position(sd.frames(), 6);
+        // smoothing keeps both ends
+        const auto p25 = sd.position(25, 6), p40 = sd.position(40, 6);
+        CHECK(sd.smooth(6, 25, 40));
+        CHECK(sd.position(25, 6).x == p25.x && sd.position(40, 6).x == p40.x && sd.position(40, 6).y == p40.y && sd.position(sd.frames(), 6).x == e0.x);
+        sd.undo();
+        CHECK(encode_tor(sd.scene()) == before);
+        // jersey colours: white is 0x0FFF
+        sd.set_shirt_jersey(0, 0x0FFF);
+        CHECK(sd.palette().rgb[254][0] > 240 && sd.palette().rgb[254][1] > 240);
+        sd.set_shirt_jersey(1, 0x0000);
+        CHECK(sd.palette().rgb[253][0] == 0 && sd.palette().rgb[253][2] == 0);
+
+        // new scene set: copies of the four scripts of the number, anzahl raised
+        int counts[3];
+        CHECK(SceneDoc::read_scene_counts(tmp, counts) && counts[0] == 11 && counts[1] == 2 && counts[2] == 2);
+        const int n = sd.add_scene_set("5.ht");
+        CHECK(n == 12);
+        for (const char* name : {"12.ht", "12.hv", "12.at", "12.av"}) CHECK(fs::exists(tmp / "TORE" / name));
+        CHECK(read_file(tmp / "TORE" / "12.at") == read_file(tmp / "TORE" / "5.at"));
+        CHECK(SceneDoc::read_scene_counts(tmp, counts) && counts[0] == 12 && counts[1] == 2);
+        CHECK(fs::exists(tmp / "TORE" / "anzahl.bak") && SceneDoc::scene_names(tmp).size() == 52);
+        CHECK(sd.add_scene_set("2.hte") == 3);
+        for (const char* name : {"3.hte", "3.hve", "3.ate", "3.ave"}) CHECK(fs::exists(tmp / "TORE" / name));
+        CHECK(SceneDoc::read_scene_counts(tmp, counts) && counts[1] == 3 && counts[0] == 12 && counts[2] == 2);
+        CHECK(sd.add_scene_set("nonsense") == -1);
+        fs::remove(tmp / "TORE" / "7.hv");
+        CHECK(sd.add_scene_set("7.ht") == -1);  // an incomplete set would crash the game: refuse
+        CHECK(SceneDoc::read_scene_counts(tmp, counts) && counts[0] == 12);
+    }
+
+    // mod packages
+    {
+        CHECK(allowed_mod_path("KB/80.vga") && allowed_mod_path("TORE/2.ht") && allowed_mod_path("TORE/anzahl"));
+        CHECK(!allowed_mod_path("KB/../EM.EXE") && !allowed_mod_path("EM.EXE") && !allowed_mod_path("KB/80.exe") && !allowed_mod_path("TORE/../x") && !allowed_mod_path("KB/a.vga"));
+        const auto files = changed_files(tmp);
+        bool has80 = false, hasTore = false;
+        for (const auto& c : files) {
+            has80 = has80 || c.path == "KB/21.vga";
+            hasTore = hasTore || c.path == "TORE/anzahl";
+        }
+        CHECK(has80 && hasTore);
+        std::string err;
+        const fs::path zip = tmp / "mod.zip";
+        CHECK(create_modpack(tmp, zip, &err) == files.size());
+        // apply into a clean copy of the original game files
+        const fs::path clean = fs::temp_directory_path() / "openem_editor_test_clean";
+        fs::remove_all(clean);
+        fs::create_directories(clean / "KB");
+        fs::create_directories(clean / "TORE");
+        fs::copy_file(src / "KB" / "21.vga", clean / "KB" / "21.vga");
+        fs::copy_file(src / "TORE" / "anzahl", clean / "TORE" / "anzahl");
+        CHECK(apply_modpack(clean, zip, &err) == int(files.size()));
+        CHECK(read_file(clean / "KB" / "21.vga") == read_file(tmp / "KB" / "21.vga") && read_file(clean / "TORE" / "anzahl") == read_file(tmp / "TORE" / "anzahl"));
+        CHECK(read_file(clean / "KB" / "21.vga.bak") == read_file(src / "KB" / "21.vga"));  // the original is kept
+        CHECK(restore_file(clean, "KB/21.vga") && read_file(clean / "KB" / "21.vga") == read_file(src / "KB" / "21.vga"));
+        for (const auto& c : changed_files(clean)) CHECK(c.path != "KB/21.vga");
+        CHECK(!restore_file(clean, "EM.EXE"));
+        // a package with a path outside KB / TORE is refused as a whole
+        ZipEntries bad{{"KB/81.vga", Bytes{1}}, {"EM.EXE", Bytes{2}}};
+        const fs::path badzip = tmp / "bad.zip";
+        {
+            const Bytes z = make_zip(bad);
+            std::ofstream o(badzip, std::ios::binary);
+            o.write(reinterpret_cast<const char*>(z.data()), std::streamsize(z.size()));
+        }
+        CHECK(apply_modpack(clean, badzip, &err) == -1 && !err.empty() && !fs::exists(clean / "KB" / "81.vga"));
+        // a ZIP made by another tool (Windows Compress-Archive: deflate)
+        const fs::path td = EM_TEST_DATA;
+        const ZipEntries z = read_zip(read_file(td / "deflate.zip"));
+        CHECK(z.size() == 2);
+        for (const auto& [name, content] : z) CHECK(content == read_file(td / (name == "text.txt" ? "deflate_text.txt" : "deflate_random.bin")));
+        bool threw = false;
+        try { read_zip(Bytes(100, 0)); } catch (const FormatError&) { threw = true; }
+        CHECK(threw);
+        fs::remove_all(clean);
     }
 
     fs::remove_all(tmp);

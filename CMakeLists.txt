@@ -18,7 +18,8 @@ add_library(em_formats STATIC
     src/formats/db.cpp
     src/formats/teamdata.cpp
     src/formats/tore.cpp
-    src/formats/vga.cpp)
+    src/formats/vga.cpp
+    src/formats/voc.cpp)
 target_include_directories(em_formats PUBLIC src)
 
 # Document logic of the editor (no UI, built and tested everywhere)
@@ -27,11 +28,14 @@ add_library(em_editor_lib STATIC
     src/editor/palette_doc.cpp
     src/editor/team_doc.cpp
     src/editor/map_doc.cpp
-    src/editor/scene_doc.cpp)
+    src/editor/scene_doc.cpp
+    src/editor/sound_doc.cpp
+    src/editor/modpack.cpp)
 target_link_libraries(em_editor_lib PUBLIC em_formats)
 
 add_executable(em_editor_tests tests/editor_tests.cpp)
 target_link_libraries(em_editor_tests PRIVATE em_editor_lib)
+target_compile_definitions(em_editor_tests PRIVATE EM_TEST_DATA="${CMAKE_SOURCE_DIR}/tests/data")
 add_executable(em_format_tests tests/format_tests.cpp)
 target_link_libraries(em_format_tests PRIVATE em_formats)
 # Pass the folder of the original game: cmake -S . -B build -DEM_DATA="<folder with EM.EXE>"

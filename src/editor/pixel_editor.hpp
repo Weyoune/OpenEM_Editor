@@ -21,7 +21,16 @@ public:
         bool embedded;  // image carries its own palette
         std::string label;
     };
-    enum class Tool { Pencil, Line, Rect, FilledRect, Fill, Picker };
+    enum class Tool { Pencil, Line, Rect, FilledRect, Fill, Picker, Select };
+    struct Rect {
+        int x0 = 0, y0 = 0, x1 = -1, y1 = -1;  // inclusive corners
+        int width() const { return x1 - x0 + 1; }
+        int height() const { return y1 - y0 + 1; }
+    };
+    struct ImportReport {
+        int pixels = 0, approximated = 0;  // approximated: no exact palette colour
+        double worst = 0, mean = 0;        // RGB distance (0..441) of the approximated pixels
+    };
 
     explicit PixelEditor(const std::filesystem::path& data);
 
@@ -39,6 +48,14 @@ public:
     // `approximated` receives the number of pixels without an exact palette match.
     bool import_argb(const std::vector<uint32_t>& argb, int w, int h, bool allow_resize, int* approximated = nullptr);
     Kind picture_kind() const { return kind_; }
+    // How far the last import was from the palette: report and a per-pixel distance map (0 = exact, 255 = far)
+    const ImportReport& last_import() const { return report_; }
+    const std::vector<uint8_t>& deviation() const { return deviation_; }
+    // Comparison with the original: pixels that differ from the backup (.bak) or, without one, from the file on disk;
+    // empty when there is nothing to compare. restore_original() copies the backup back over the file and reloads it.
+    bool has_backup() const;
+    std::vector<uint8_t> changed_pixels() const;
+    bool restore_original();
     void undo();
     void redo();
     bool can_undo() const { return !undo_.empty(); }
@@ -55,6 +72,20 @@ public:
     void stroke_end();
     bool drawing() const { return drawing_; }
     int pick(int x, int y) const;  // colour index at a pixel, -1 outside
+
+    // Selection (tool Select: drag draws a rectangle, dragging inside it moves the pixels) and clipboard
+    bool has_selection() const { return sel_valid_; }
+    Rect selection() const { return sel_; }
+    void select_all();
+    void clear_selection();
+    bool copy();
+    bool cut();
+    bool paste(int x, int y);  // top left corner; the pasted pixels become the selection
+    bool has_clipboard() const { return !clip_.pixels.empty(); }
+    bool delete_selection();   // colour 0
+    // Mirror or rotate the selection (without one: the whole picture, plain images only); rotation needs a square
+    bool flip(bool horizontal);
+    bool rotate_cw();
 
     bool dirty() const { return dirty_; }
     int current() const { return current_; }
@@ -92,7 +123,16 @@ private:
     bool drawing_ = false;
     int sx_ = 0, sy_ = 0, lx_ = 0, ly_ = 0;
     std::vector<uint8_t> base_;
-    std::unordered_set<uint32_t> cache_inexact_;  // scratch of import_argb
+    ImportReport report_;
+    std::vector<uint8_t> deviation_;
+    bool sel_valid_ = false;
+    Rect sel_, sel_orig_;
+    int anchor_x_ = 0, anchor_y_ = 0, press_x_ = 0, press_y_ = 0;
+    enum class Drag { None, Select, Move } drag_ = Drag::None;
+    std::vector<uint8_t> float_;
+    Image clip_;
+    bool load_file(const std::filesystem::path& p, int number);
+    bool region(Rect& r, const char* what);
 
     void put(int x, int y, int c);
     void draw_line(int x0, int y0, int x1, int y1, int c);

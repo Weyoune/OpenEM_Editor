@@ -36,6 +36,7 @@ struct Image {
     Image() = default;
     Image(int w, int h, uint8_t fill = 0) : width(w), height(h), pixels(size_t(w) * h, fill) {}
     uint8_t& at(int x, int y) { return pixels[size_t(y) * width + x]; }
+    const uint8_t& at(int x, int y) const { return pixels[size_t(y) * width + x]; }
 };
 
 // 256 colours, 8 bit per channel
