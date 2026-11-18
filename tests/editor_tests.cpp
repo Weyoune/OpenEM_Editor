@@ -258,6 +258,42 @@ int main(int argc, char** argv) {
         CHECK(after == 0);
     }
 
+    // 16-level photos of mods (KB200..229): index bits reversed, shown with a grey palette automatically
+    {
+        // a smooth diagonal ramp of 16 grey levels, stored with the index bits reversed (like the photos of the Bayern edition)
+        Image photo(64, 48);
+        for (int y = 0; y < 48; y++)
+            for (int x = 0; x < 64; x++) {
+                const int level = std::clamp((x + y) / 7 + ((x * 7 + y * 13) % 3) - 1, 0, 15);  // a little noise like a photo
+                photo.at(x, y) = uint8_t((level & 1) << 3 | (level & 2) << 1 | (level & 4) >> 1 | (level & 8) >> 3);
+            }
+        const Bytes enc = encode_vga(photo);
+        {
+            std::ofstream f(tmp / "KB" / "229.vga", std::ios::binary);
+            f.write(reinterpret_cast<const char*>(enc.data()), std::streamsize(enc.size()));
+        }
+        PixelEditor pe(tmp);
+        CHECK(pe.load(229) && pe.palette_source() == PixelEditor::kGreyPhoto);
+        CHECK(pe.palette().rgb[0][0] == 0 && pe.palette().rgb[8][0] == 17 && pe.palette().rgb[15][0] == 255 && pe.palette().rgb[16][0] == 0);
+        CHECK(pe.palette().rgb[1][0] == 8 * 17 && pe.palette().rgb[5][0] == 10 * 17);  // index 1 = level 8, index 5 = level 10
+        bool listed = false;
+        for (int n : pe.palette_choices()) listed = listed || n == PixelEditor::kGreyPhoto;
+        CHECK(listed && pe.set_palette_source(21) && pe.set_palette_source(PixelEditor::kGreyPhoto));
+        // a normal 16-step ramp (index = level) is no photo of that kind and keeps the game palette
+        Image ramp(64, 48);
+        for (int y = 0; y < 48; y++)
+            for (int x = 0; x < 64; x++) ramp.at(x, y) = uint8_t(std::clamp((x + y) / 7 + ((x * 7 + y * 13) % 3) - 1, 0, 15));
+        const Bytes enc2 = encode_vga(ramp);
+        {
+            std::ofstream f(tmp / "KB" / "228.vga", std::ios::binary);
+            f.write(reinterpret_cast<const char*>(enc2.data()), std::streamsize(enc2.size()));
+        }
+        PixelEditor pe2(tmp);
+        CHECK(pe2.load(228) && pe2.palette_source() == 21);
+        fs::remove(tmp / "KB" / "229.vga");
+        fs::remove(tmp / "KB" / "228.vga");
+    }
+
     // hall map editor
     {
         MapDoc md(tmp);

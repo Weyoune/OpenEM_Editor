@@ -3570,7 +3570,7 @@ LRESULT CALLBACK main_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             a.palette = CreateWindowExW(0, kPaletteClass, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, h, nullptr, a.inst, nullptr);
             a.psel = CreateWindowExW(0, L"COMBOBOX", nullptr, WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP | CBS_DROPDOWNLIST, 0, 0, 0, 0, h, (HMENU)IDC_PALSEL, a.inst, nullptr);
             for (int n : a.ed->palette_choices()) {
-                std::wstring label = n == 21 ? L"Palette: Spiel (KB21)" : n == 247 ? L"Palette: Torszenen (KB247)" : L"Palette: wie KB" + std::to_wstring(n);
+                std::wstring label = n == 21 ? L"Palette: Spiel (KB21)" : n == 247 ? L"Palette: Torszenen (KB247)" : n == PixelEditor::kGreyPhoto ? L"Palette: Graustufen-Foto (16 Stufen)" : L"Palette: wie KB" + std::to_wstring(n);
                 const LRESULT i = SendMessage(a.psel, CB_ADDSTRING, 0, (LPARAM)label.c_str());
                 SendMessage(a.psel, CB_SETITEMDATA, WPARAM(i), n);
             }

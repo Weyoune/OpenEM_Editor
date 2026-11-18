@@ -92,17 +92,44 @@ PixelEditor::PixelEditor(const fs::path& data) : kb_(data / "KB") {
 // Images drawn by the game over the palette of another screen (found in src/ui): KB8 over KB14
 static int default_source(int number) { return number == 8 ? 14 : 21; }
 
+// 16-level photos (mods): only the indices 0..15 occur and the lowest bit is the smoothest one (bit order reversed)
+static bool looks_like_grey_photo(const Image& img) {
+    if (img.pixels.size() < 2000) return false;
+    for (uint8_t v : img.pixels)
+        if (v > 15) return false;
+    double same[4] = {0, 0, 0, 0};
+    long n = 0;
+    for (int y = 0; y < img.height; y++)
+        for (int x = 0; x + 1 < img.width; x++) {
+            const int p = img.pixels[size_t(y) * img.width + x], q = img.pixels[size_t(y) * img.width + x + 1];
+            for (int b = 0; b < 4; b++) same[b] += ((p >> b) & 1) == ((q >> b) & 1);
+            n++;
+        }
+    return n > 0 && same[0] / double(n) > same[3] / double(n) + 0.15 && same[0] > same[1] && same[1] > same[2];
+}
+
 std::vector<int> PixelEditor::palette_choices() const {
     std::vector<int> out;
     for (int n : {21, 247, 5, 14, 16, 151, 195, 197}) {
         std::error_code ec;
         if (fs::exists(kb_ / (std::to_string(n) + ".vga"), ec)) out.push_back(n);
     }
+    out.push_back(kGreyPhoto);
     return out;
 }
 
 bool PixelEditor::set_palette_source(int number) {
     if (current_ >= 0 && has_embedded_) return false;  // the image brings its own palette
+    if (number == kGreyPhoto) {
+        pal_ = Palette();
+        for (int i = 0; i < 16; i++) {
+            const int level = (i & 1) << 3 | (i & 2) << 1 | (i & 4) >> 1 | (i & 8) >> 3;
+            pal_.rgb[size_t(i)] = {uint8_t(level * 17), uint8_t(level * 17), uint8_t(level * 17)};
+        }
+        pal_source_ = number;
+        revision_++;
+        return true;
+    }
     try {
         Bytes d = read_file(kb_ / (std::to_string(number) + ".vga"));
         if (number == 21 || number == 247) pal_ = decode_palette(d);
@@ -160,10 +187,11 @@ bool PixelEditor::load_file(const fs::path& p, int number) {
             }
             img = decode_vga(d);
             embedded = k == VgaKind::ImageWithPalette;
-            what = embedded ? std::string("eigene Palette") : "Palette KB" + std::to_string(default_source(number));
+            what = embedded ? std::string("eigene Palette") : looks_like_grey_photo(img) ? std::string("Graustufen-Foto, 16 Stufen") : "Palette KB" + std::to_string(default_source(number));
             if (!img.complete) what += ", Datenstrom unvollständig";
         }
-        const int source = embedded ? number : kind != Kind::Image ? 247 : default_source(number);
+        int source = embedded ? number : kind != Kind::Image ? 247 : default_source(number);
+        if (!embedded && kind == Kind::Image && source == 21 && ((number >= 200 && number <= 229 && looks_like_grey_photo(img)) || looks_like_grey_photo(img))) source = kGreyPhoto;
         img_ = std::move(img);
         has_embedded_ = embedded;
         pal_ = embedded ? decode_palette(d, 6 + le16(d, 4)) : global_pal_;

@@ -95,6 +95,9 @@ public:
     // palette of a full screen (KB5, 14, 16, 151, 195, 197) - the game keeps the palette of the last screen it loaded,
     // e.g. KB8 (stadium parts) is drawn over KB14. The choice does not change what is saved.
     std::vector<int> palette_choices() const;
+    // Pseudo palette for the newspaper photos of some mods (KB200..229): 16 grey levels whose palette index is stored
+    // bit-reversed (index bit 0 is the most significant brightness bit), entries 16..255 black.
+    static constexpr int kGreyPhoto = 1000;
     int palette_source() const { return pal_source_; }
     bool set_palette_source(int number);
     bool has_own_palette() const { return has_embedded_; }
