@@ -1,6 +1,6 @@
 # Bedienung des OpenEM Editors (`em_editor`)
 
-Bearbeitet die Dateien des Originalspiels. Version 0.2, nur Windows (Win32 mit Standard-Steuerelementen). Die Dokumentlogik (`src/editor/*_doc.*`, `pixel_editor.*`, `modpack.*`) hat keine Oberflächenabhängigkeit und läuft im Test (`ctest`, mit `-DEM_DATA=<Spielordner>`).
+Bearbeitet die Dateien des Originalspiels. Version 0.2.1, nur Windows (Win32 mit Standard-Steuerelementen). Die Dokumentlogik (`src/editor/*_doc.*`, `pixel_editor.*`, `modpack.*`) hat keine Oberflächenabhängigkeit und läuft im Test (`ctest`, mit `-DEM_DATA=<Spielordner>`).
 
 ```
 em_editor [--data <EM-Ordner>] [--tab 0..6] [--file <KB-Nr.>] [--scene <Name>] [--frame <n>] [--mode 0|1|2]
@@ -22,6 +22,8 @@ em_editor [--data <EM-Ordner>] [--tab 0..6] [--file <KB-Nr.>] [--scene <Name>] [
 | Töne | die Töne der Torszenen `KB\237–241` (siehe unten) |
 
 ## Pixel-Editor (Bilder, Torszenen)
+
+Bilder ohne eigene Palette zeigt der Editor mit der Spielpalette; 16-stufige Graustufen-Fotos (nur Indizes 0-15, Bits gespiegelt, z. B. KB200-229 der Bayern-Edition) erkennt er automatisch und zeigt sie mit der Palette "Graustufen-Foto".
 
 Werkzeuge: Stift (P), Linie (L), Rechteck (R), gefülltes Rechteck (B), Füllen (F), Pipette (I oder Rechtsklick), **Auswahl (M)**; Rückgängig/Wiederholen (Strg+Z/Y), Speichern (Strg+S), Raster (G), Zoom (Strg+Mausrad, +/−).
 
